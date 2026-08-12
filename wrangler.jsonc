@@ -3,7 +3,7 @@
   "name": "recapmaker--2727",
   "main": "cloudflare/src/entry.py",
   "compatibility_date": "2026-08-12",
-  "compatibility_flags": ["python_workers"],
+  "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
   "workers_dev": true,
   "observability": {
     "enabled": true,
