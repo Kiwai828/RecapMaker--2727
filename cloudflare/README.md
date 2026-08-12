@@ -41,7 +41,7 @@ Set secrets. Never put these values in `wrangler.jsonc`, D1, Git, or the APK:
 
 ```bash
 openssl rand -base64 48 | npx wrangler secret put JWT_SECRET
-openssl rand -base64 32 | npx wrangler secret put ADMIN_BOOTSTRAP_TOKEN
+npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put GEMINI_KEY_1
 npx wrangler secret put GEMINI_KEY_2
 npx wrangler secret put GEMINI_KEY_3
@@ -58,19 +58,15 @@ uv run pywrangler deploy
 
 The deployment URL is a `workers.dev` URL unless a custom domain is configured. Set the Android backend base URL to that URL with a trailing slash. The Worker must be deployed before the Android app is used against it.
 
-## First admin bootstrap
+## First admin login
 
-1. Register an account using the configured `ADMIN_EMAIL`.
-2. Bootstrap it once, before opening the panel:
+Set `ADMIN_EMAIL` in `wrangler.jsonc` and set the matching `ADMIN_PASSWORD` as a Worker secret. The administrator account is created or synchronized automatically on the first successful login; no bootstrap endpoint or one-time token is required.
 
 ```bash
-curl -X POST "https://YOUR_WORKER_URL/api/v1/admin/bootstrap" \
-  -H "X-Admin-Email: admin@example.com" \
-  -H "X-Admin-Bootstrap-Token: YOUR_BOOTSTRAP_TOKEN"
+npx wrangler secret put ADMIN_PASSWORD
 ```
 
-3. Open `https://YOUR_WORKER_URL/admin` and sign in.
-4. Add Gemini account/project/model slots. A slot has its own concurrency, RPM, and daily limits. The scheduler chooses the least-recently-used eligible slot, cools down provider failures, and runs one message per queue consumer invocation.
+Open `https://YOUR_WORKER_URL/admin` and sign in with the configured email and environment password. The configured password is the source of truth; if it changes, the stored admin hash is synchronized on the next login. Add Gemini account/project/model slots after signing in. A slot has its own concurrency, RPM, and daily limits. The scheduler chooses the least-recently-used eligible slot, cools down provider failures, and runs one message per queue consumer invocation.
 
 ## Credit plans and payment handling
 

@@ -145,6 +145,43 @@ def db_of(request: Request) -> Any:
     return env_of(request).DB
 
 
+def configured_admin_email(env: Any) -> str:
+    return str(getattr(env, "ADMIN_EMAIL", "")).strip().lower()
+
+
+def configured_admin_password(env: Any) -> str:
+    password = str(getattr(env, "ADMIN_PASSWORD", ""))
+    if len(password) < 12:
+        raise ValueError("ADMIN_PASSWORD must be configured with at least 12 characters")
+    return password
+
+
+async def ensure_env_admin(db: Any, env: Any) -> dict[str, Any]:
+    email = configured_admin_email(env)
+    password = configured_admin_password(env)
+    if not email or "@" not in email:
+        raise ValueError("ADMIN_EMAIL must be configured")
+    row = await first_row(db, "SELECT * FROM users WHERE email=?", email)
+    if not row:
+        user_id = str(uuid.uuid4())
+        await run(db, "INSERT INTO users(id,email,password_hash,display_name,is_admin) VALUES(?,?,?,?,1)", user_id, email, hash_password(password), "Administrator")
+        await ensure_account(db, user_id)
+        row = await first_row(db, "SELECT * FROM users WHERE id=?", user_id)
+    elif not verify_password(password, str(row.get("password_hash") or "")) or not row.get("is_admin"):
+        await run(db, "UPDATE users SET password_hash=?,is_admin=1,is_active=1,is_banned=0,updated_at=datetime('now') WHERE id=?", hash_password(password), row["id"])
+        row = await first_row(db, "SELECT * FROM users WHERE id=?", row["id"])
+    has_plan = await first_row(db, "SELECT id FROM user_plans WHERE user_id=? AND (expires_at IS NULL OR expires_at>datetime('now'))", row["id"])
+    if not has_plan:
+        free = await first_row(db, "SELECT id,validity_days,included_credits FROM plans WHERE name='Free' AND active=1")
+        if free:
+            validity = int(free.get("validity_days") or 0)
+            expires = f"+{validity} days" if validity else None
+            await run(db, "INSERT INTO user_plans(id,user_id,plan_id,expires_at) VALUES(?,?,?,CASE WHEN ? IS NULL THEN NULL ELSE datetime('now',?) END)", str(uuid.uuid4()), row["id"], free["id"], expires, expires)
+            if int(free.get("included_credits") or 0) > 0:
+                await add_credits(db, row["id"], int(free["included_credits"]), "plan_grant", reference_id=free["id"], description="Administrator welcome credits", idempotency_key=f"welcome:{row['id']}")
+    return await first_row(db, "SELECT * FROM users WHERE id=?", row["id"])
+
+
 async def user_dep(request: Request) -> dict[str, Any]:
     try:
         return await current_user(request, env_of(request), db_of(request))
@@ -199,6 +236,8 @@ async def ready(request: Request):
 @app.post("/api/v1/auth/register")
 async def register(request: Request, body: RegisterBody):
     db = db_of(request)
+    if body.email == configured_admin_email(env_of(request)):
+        raise HTTPException(status_code=409, detail="Administrator account is managed by ADMIN_PASSWORD")
     existing = await first_row(db, "SELECT id FROM users WHERE email=?", body.email)
     if existing:
         raise HTTPException(status_code=409, detail="Account already exists")
@@ -219,9 +258,19 @@ async def register(request: Request, body: RegisterBody):
 @app.post("/api/v1/auth/login")
 async def login(request: Request, body: LoginBody):
     db = db_of(request)
-    user = await first_row(db, "SELECT * FROM users WHERE email=?", body.email.strip().lower())
-    if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    email = body.email.strip().lower()
+    if email == configured_admin_email(env_of(request)):
+        try:
+            user = await ensure_env_admin(db, env_of(request))
+            valid = hmac_compare(body.password, configured_admin_password(env_of(request)))
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if not valid:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+    else:
+        user = await first_row(db, "SELECT * FROM users WHERE email=?", email)
+        if not user or not verify_password(body.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.get("is_active") or user.get("is_banned"):
         raise HTTPException(status_code=403, detail="Account unavailable")
     return json_response(await issue_tokens(db, env_of(request), user))
@@ -557,20 +606,6 @@ async def admin_slot_update(request: Request, slot_id: str, body: SlotBody, admi
 @app.get("/api/v1/admin/audit")
 async def admin_audit(request: Request, limit: int = Query(default=200, ge=1, le=500), admin: dict[str, Any] = Depends(admin_dep)):
     return json_response(await all_rows(db_of(request), "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", limit))
-
-
-@app.post("/api/v1/admin/bootstrap")
-async def admin_bootstrap(request: Request, email: str = Header(..., alias="X-Admin-Email"), token: str = Header(..., alias="X-Admin-Bootstrap-Token")):
-    env = env_of(request)
-    if email.strip().lower() != str(getattr(env, "ADMIN_EMAIL", "")).lower() or not hmac_compare(token, str(getattr(env, "ADMIN_BOOTSTRAP_TOKEN", ""))):
-        raise HTTPException(status_code=403, detail="Bootstrap denied")
-    db = db_of(request)
-    row = await first_row(db, "SELECT * FROM users WHERE email=?", email.strip().lower())
-    if not row:
-        raise HTTPException(status_code=404, detail="Register the admin email first")
-    await run(db, "UPDATE users SET is_admin=1 WHERE id=?", row["id"])
-    await write_audit(db, row["id"], "admin_bootstrap", "user", row["id"], {})
-    return json_response({"ok": True, "user_id": row["id"]})
 
 
 def hmac_compare(a: str, b: str) -> bool:

@@ -62,6 +62,6 @@
     ]
   },
   "secrets": {
-    "required": ["JWT_SECRET", "ADMIN_BOOTSTRAP_TOKEN"]
+    "required": ["JWT_SECRET", "ADMIN_PASSWORD"]
   }
 }

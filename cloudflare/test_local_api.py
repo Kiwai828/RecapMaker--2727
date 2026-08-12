@@ -69,7 +69,7 @@ class Env:
     QUEUE_MAX_DEPTH = "500"
     FREE_DAILY_JOB_LIMIT = "3"
     ADMIN_EMAIL = "admin@example.com"
-    ADMIN_BOOTSTRAP_TOKEN = "bootstrap-token"
+    ADMIN_PASSWORD = "correct horse battery staple"
 
     def __init__(self):
         self.DB = D1()
@@ -90,10 +90,11 @@ class EnvMiddleware:
 def test_cloudflare_core_lifecycle():
     env = Env()
     with TestClient(EnvMiddleware(main.app, env)) as client:
-        registered = client.post("/api/v1/auth/register", json={"email": "admin@example.com", "password": "correct horse battery", "display_name": "Admin"})
-        assert registered.status_code == 200, registered.text
-        access = registered.json()["access_token"]
-        assert client.post("/api/v1/admin/bootstrap", headers={"X-Admin-Email": "admin@example.com", "X-Admin-Bootstrap-Token": "bootstrap-token"}).status_code == 200
+        registered = client.post("/api/v1/auth/register", json={"email": "admin@example.com", "password": "not-used-for-admin", "display_name": "Admin"})
+        assert registered.status_code == 409, registered.text
+        logged_in = client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "correct horse battery staple"})
+        assert logged_in.status_code == 200, logged_in.text
+        access = logged_in.json()["access_token"]
         headers = {"Authorization": f"Bearer {access}"}
         assert client.get("/api/v1/auth/me", headers=headers).json()["is_admin"] is True
         admin_page = client.get("/admin")
