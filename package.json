@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "build": "sh scripts/cloudflare-build.sh",
-    "deploy": "npx wrangler deploy",
+    "deploy": "npm run build && npx wrangler deploy",
     "preview": "npx wrangler versions upload"
   },
   "devDependencies": {
