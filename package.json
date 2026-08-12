@@ -2,9 +2,9 @@
   "name": "voicerecap-cloudflare-worker",
   "private": true,
   "scripts": {
-    "build": "cd cloudflare && uvx --from workers-py pywrangler sync",
-    "deploy": "cd cloudflare && uvx --from workers-py pywrangler deploy",
-    "preview": "cd cloudflare && uvx --from workers-py pywrangler versions upload"
+    "build": "sh scripts/cloudflare-build.sh",
+    "deploy": "npx wrangler deploy",
+    "preview": "npx wrangler versions upload"
   },
   "devDependencies": {
     "wrangler": "^4.122.0"

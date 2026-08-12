@@ -15,7 +15,7 @@ Set the Workers Builds commands as follows:
 | Non-production deploy command | `npx wrangler versions upload` |
 | Root directory | `/` or empty |
 
-The build command runs `uvx --from workers-py pywrangler sync` inside `cloudflare/`; the deploy command then uses the root `wrangler.jsonc`, whose `main` is `cloudflare/src/entry.py`. The previous build failed because Cloudflare ran `npx wrangler deploy` from the repository root while no root Wrangler configuration existed, so Wrangler attempted to detect a static asset directory.
+The build command runs `scripts/cloudflare-build.sh`, which uses `uvx --from workers-py pywrangler sync` inside `cloudflare/`. If the build image does not already provide `uvx`, the script installs `uv` with its official installer before synchronizing Python dependencies. The deploy command then uses the root `wrangler.jsonc`, whose `main` is `cloudflare/src/entry.py`. The previous build failed because Cloudflare ran `npx wrangler deploy` from the repository root while no root Wrangler configuration existed, so Wrangler attempted to detect a static asset directory.
 
 Cloudflare Workers Builds requires the Worker name in the dashboard to match the `name` in the Wrangler configuration. The current configuration uses `recapmaker--2727`, matching this repository's current Workers project name. If the dashboard Worker has a different name, either rename the Worker or change `name` in both Wrangler configurations before deploying.
 

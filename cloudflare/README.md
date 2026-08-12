@@ -2,7 +2,7 @@
 
 This directory is a Cloudflare Python Worker deployment for VoiceRecap. It provides an authenticated FastAPI-compatible API, D1 state, R2 audio/backup storage, a Queue-backed fair transcription scheduler, credit-based plans, MMK/USDT payment order review, user backup/export, audit logging, and a browser admin panel at `/admin`.
 
-When deploying through **Workers Builds → Import a repository**, use the repository root (`/`) because the repository also contains a root `wrangler.jsonc`. Set the Build command to `npm run build` and the Deploy command to `npx wrangler deploy`. The build command runs `uvx --from workers-py pywrangler sync` in this directory before Wrangler deploys `cloudflare/src/entry.py`. The Worker name is `recapmaker--2727`, and it must match the Worker name in the dashboard.
+When deploying through **Workers Builds → Import a repository**, use the repository root (`/`) because the repository also contains a root `wrangler.jsonc`. Set the Build command to `npm run build` and the Deploy command to `npx wrangler deploy`. The build command runs `scripts/cloudflare-build.sh`; it uses `uvx --from workers-py pywrangler sync` in this directory and installs `uv` first only when `uvx` is not already available. Wrangler then deploys `cloudflare/src/entry.py`. The Worker name is `recapmaker--2727`, and it must match the Worker name in the dashboard.
 
 Cloudflare currently documents Python Workers and FastAPI support, but the Python runtime is still in open beta. The Worker is therefore intentionally isolated from the Android client contract and uses D1/R2/Queues bindings instead of Uvicorn, SQLAlchemy, or PostgreSQL. See `../CLOUDFLARE_DEPLOYMENT_NOTES.md` for the architecture rationale and Free-tier boundaries.
 

@@ -19,3 +19,11 @@ The repository now has a root `wrangler.jsonc` with `main: cloudflare/src/entry.
 ## Dashboard settings
 
 Use repository root `/` (empty Root directory), Build command `npm run build`, Deploy command `npx wrangler deploy`, and non-production deploy command `npx wrangler versions upload`. The Worker name should be `recapmaker--2727`. The root configuration omits a D1 ID so Wrangler can use automatic resource provisioning; if resources were created manually, add the real IDs/names before deploying.
+
+## Build-image portability update
+
+Cloudflare's Workers Builds image documents Node.js, Python, pip, pipx, and curl as supported/preinstalled tooling, but does not list uv or uvx among the preinstalled tools. Source: https://developers.cloudflare.com/workers/ci-cd/builds/build-image/
+
+The repository therefore uses `scripts/cloudflare-build.sh` as the `npm run build` command. It uses `uvx` when available and otherwise installs uv using the official uv installer, then runs `pywrangler sync`. This avoids relying on an undocumented preinstalled uvx binary while preserving the standard `npx wrangler deploy` deploy command used by Workers Builds.
+
+Cloudflare's Python packages guide states that pywrangler manages packages and bundles dependencies on deployment; the project uses pywrangler sync during the build step and the root Wrangler configuration for deployment. Source: https://developers.cloudflare.com/workers/languages/python/packages/
