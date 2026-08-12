@@ -389,9 +389,17 @@ async def create_transcription_job(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255),
     user: dict[str, Any] = Depends(user_dep),
 ):
+    """Transcribe request-scoped audio without persisting any media.
+
+    The Android client keeps the video, extracted WAV, transcript, TTS audio,
+    and final MP4 locally. This endpoint buffers only the current WAV in memory,
+    sends it to Gemini, and releases it before returning.
+    """
+    from scheduler import transcribe_direct
+
     db = db_of(request)
     if idempotency_key:
-        old = await first_row(db, "SELECT id,status,result_json,error_code,error_message FROM processing_jobs WHERE user_id=? AND idempotency_key=?", user["id"], idempotency_key)
+        old = await first_row(db, "SELECT id,status,result_json,error_code,error_message,provider_model FROM processing_jobs WHERE user_id=? AND idempotency_key=?", user["id"], idempotency_key)
         if old:
             return json_response(_job_payload(old))
     plan = await active_plan(db, user["id"])
@@ -400,22 +408,37 @@ async def create_transcription_job(
     if plan.get("name") == "Free" and int((jobs_today or {}).get("count") or 0) >= free_limit:
         raise HTTPException(status_code=429, detail="Daily free processing limit reached")
     depth = await first_row(db, "SELECT COUNT(*) AS count FROM processing_jobs WHERE status IN ('queued','processing')")
-    if int((depth or {}).get("count") or 0) >= int(getattr(env_of(request), "QUEUE_MAX_DEPTH", "500")):
-        raise HTTPException(status_code=429, detail="Processing queue is full", headers={"Retry-After": "60"})
+    if int((depth or {}).get("count") or 0) >= int(getattr(env_of(request), "ACTIVE_REQUEST_MAX", "100")):
+        raise HTTPException(status_code=429, detail="Too many active requests", headers={"Retry-After": "30"})
+
     data = await read_audio_bytes(request)
     job_id = str(uuid.uuid4())
-    audio_key = f"audio/{user['id']}/{job_id}.wav"
-    await env_of(request).MEDIA.put(audio_key, data, {"httpMetadata": {"contentType": request.headers.get("Content-Type", "audio/wav")}})
     cost = video_cost(plan, video_duration_seconds)
     try:
         await add_credits(db, user["id"], -cost, "transcription_reservation", reference_id=job_id, description=f"Reserved for {target_language}", idempotency_key=f"job:{job_id}")
     except CreditError as exc:
-        await env_of(request).MEDIA.delete(audio_key)
+        data = b""
         raise HTTPException(status_code=402, detail=str(exc)) from exc
-    await run(db, "INSERT INTO processing_jobs(id,user_id,status,target_language,audio_key,idempotency_key,credits_reserved) VALUES(?,?, 'queued',?,?,?,?)", job_id, user["id"], target_language.strip(), audio_key, idempotency_key, cost)
-    await env_of(request).JOB_QUEUE.send({"job_id": job_id})
-    await write_audit(db, user["id"], "transcription_queued", "processing_job", job_id, {"credits_reserved": cost, "target_language": target_language})
-    return json_response({"job_id": job_id, "status": "queued", "poll_after_seconds": 3})
+
+    # audio_key remains an empty compatibility field for the existing D1 schema;
+    # no media object is created in R2.
+    await run(db, "INSERT INTO processing_jobs(id,user_id,status,target_language,audio_key,idempotency_key,credits_reserved,started_at) VALUES(?,?, 'processing',?,?,?, ?,datetime('now'))", job_id, user["id"], target_language.strip(), "", idempotency_key, cost)
+    await write_audit(db, user["id"], "transcription_started", "processing_job", job_id, {"credits_reserved": cost, "target_language": target_language.strip(), "media_retention": "none"})
+    try:
+        result, slot = await transcribe_direct(env_of(request), data, target_language.strip())
+        await run(db, "UPDATE processing_jobs SET status='completed',result_json=?,provider_model=?,provider_slot=?,credits_committed=credits_reserved,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", json.dumps(result, ensure_ascii=False, separators=(",", ":")), slot["model"], slot["id"], job_id)
+        await write_audit(db, user["id"], "transcription_completed", "processing_job", job_id, {"provider_model": slot["model"], "media_retention": "none"})
+        return json_response({"job_id": job_id, "status": "completed", "poll_after_seconds": 0, "result": result, "provider_model": slot["model"]})
+    except Exception as exc:
+        text = str(exc)[:500]
+        await run(db, "UPDATE processing_jobs SET status='failed',error_code='GEMINI_FAILED',error_message=?,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", text, job_id)
+        await add_credits(db, user["id"], cost, "job_refund", reference_id=job_id, description="Refund for failed transcription", idempotency_key=f"refund:{job_id}")
+        if "no_gemini_slot_available" in text:
+            raise HTTPException(status_code=429, detail="All Gemini slots are busy. Please retry shortly.", headers={"Retry-After": "30"}) from exc
+        raise HTTPException(status_code=502, detail={"code": "GEMINI_FAILED", "message": "Gemini transcription failed; reserved credits were refunded."}) from exc
+    finally:
+        # Drop the only request-scoped media reference as soon as the call ends.
+        data = b""
 
 
 @app.get("/api/v1/transcribe/{job_id}")
@@ -432,18 +455,21 @@ def _job_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/v1/backup/export")
 async def backup_export(request: Request, user: dict[str, Any] = Depends(user_dep)):
+    """Return metadata only; the backend never writes a backup object.
+
+    The Android app is responsible for saving this JSON locally beside its local
+    project media. Server-owned credits and account state are intentionally not
+    imported from this payload.
+    """
     db = db_of(request)
-    projects = await all_rows(db, "SELECT external_id,title,target_language,source_name,source_object_key,settings_json,created_at,updated_at FROM user_projects WHERE user_id=? ORDER BY updated_at DESC LIMIT 500", user["id"])
+    projects = await all_rows(db, "SELECT external_id,title,target_language,source_name,settings_json,created_at,updated_at FROM user_projects WHERE user_id=? ORDER BY updated_at DESC LIMIT 500", user["id"])
     jobs = await all_rows(db, "SELECT id,status,target_language,provider_model,created_at,completed_at,error_code FROM processing_jobs WHERE user_id=? ORDER BY created_at DESC LIMIT 500", user["id"])
     ledger = await all_rows(db, "SELECT delta,kind,reference_id,description,created_at FROM credit_ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 1000", user["id"])
-    backup = {"backup_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(), "profile": public_user(user), "projects": projects, "processing_history": jobs, "credit_history": ledger}
-    key = f"backups/{user['id']}/{int(time.time())}-{secrets.token_hex(6)}.json"
+    backup = {"backup_version": 2, "exported_at": datetime.now(timezone.utc).isoformat(), "profile": public_user(user), "projects": projects, "processing_history": jobs, "credit_history": ledger, "media_retention": "none"}
     raw = json.dumps(backup, ensure_ascii=False, separators=(",", ":")).encode()
-    await env_of(request).BACKUPS.put(key, raw, {"httpMetadata": {"contentType": "application/json"}})
     checksum = hashlib.sha256(raw).hexdigest()
-    await run(db, "INSERT INTO backup_manifests(id,user_id,object_key,checksum,byte_size) VALUES(?,?,?,?,?)", str(uuid.uuid4()), user["id"], key, checksum, len(raw))
-    await write_audit(db, user["id"], "backup_exported", "backup", key, {"bytes": len(raw)})
-    return json_response({"object_key": key, "checksum": checksum, "byte_size": len(raw), "backup": backup})
+    await write_audit(db, user["id"], "backup_exported", "backup", user["id"], {"bytes": len(raw), "media_retention": "none"})
+    return json_response({"checksum": checksum, "byte_size": len(raw), "backup": backup})
 
 
 @app.post("/api/v1/backup/import")
@@ -457,10 +483,7 @@ async def backup_import(request: Request, body: BackupImportBody, user: dict[str
         title = str(project.get("title") or "Imported project").strip()[:200]
         if not external_id or not title:
             continue
-        object_key = project.get("source_object_key")
-        if object_key and not str(object_key).startswith((f"uploads/{user['id']}/", f"audio/{user['id']}/")):
-            object_key = None
-        await run(db, "INSERT INTO user_projects(id,user_id,external_id,title,target_language,source_name,source_object_key,settings_json,updated_at) VALUES(?,?,?,?,?,?,?,?,datetime('now')) ON CONFLICT(user_id,external_id) DO UPDATE SET title=excluded.title,target_language=excluded.target_language,source_name=excluded.source_name,source_object_key=excluded.source_object_key,settings_json=excluded.settings_json,updated_at=datetime('now')", str(uuid.uuid4()), user["id"], external_id, title, project.get("target_language"), project.get("source_name"), object_key, dumps(project.get("settings") or project.get("settings_json") or {}))
+        await run(db, "INSERT INTO user_projects(id,user_id,external_id,title,target_language,source_name,source_object_key,settings_json,updated_at) VALUES(?,?,?,?,?,?,NULL,?,datetime('now')) ON CONFLICT(user_id,external_id) DO UPDATE SET title=excluded.title,target_language=excluded.target_language,source_name=excluded.source_name,source_object_key=NULL,settings_json=excluded.settings_json,updated_at=datetime('now')", str(uuid.uuid4()), user["id"], external_id, title, project.get("target_language"), project.get("source_name"), dumps(project.get("settings") or project.get("settings_json") or {}))
         restored += 1
     await write_audit(db, user["id"], "backup_imported", "user", user["id"], {"project_count": restored})
     return json_response({"ok": True, "imported_projects": restored, "note": "Project metadata was restored. Processing history and credit balance remain server-owned."})

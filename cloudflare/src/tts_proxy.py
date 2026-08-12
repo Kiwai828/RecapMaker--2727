@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -107,8 +108,17 @@ async def synthesize(env: Any, config: dict[str, Any], text: str) -> tuple[bytes
     if mode == "ultimate_clone":
         payload["prompt_audio_base64"] = config.get("reference_audio_base64")
         payload["prompt_text"] = config.get("reference_transcript")
-    options = {"method": "POST", "headers": to_js({"Content-Type": "application/json"}, dict_converter=Object.fromEntries), "body": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
-    response = await fetch(_modal_url(env, mode), to_js(options, dict_converter=Object.fromEntries))
+    options = {
+        "method": "POST",
+        "cache": "no-store",
+        "headers": to_js({"Content-Type": "application/json", "Cache-Control": "no-store", "Pragma": "no-cache", "X-VoiceRecap-Retention": "none"}, dict_converter=Object.fromEntries),
+        "body": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    }
+    timeout_seconds = min(max(int(getattr(env, "PROVIDER_TIMEOUT_SECONDS", "900")), 30), 900)
+    try:
+        response = await asyncio.wait_for(fetch(_modal_url(env, mode), to_js(options, dict_converter=Object.fromEntries)), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise TtsProxyError("MODAL_TIMEOUT", "Modal inference exceeded the 15-minute application limit.", 504) from exc
     status = int(response.status)
     raw = await _response_bytes(response) if status < 400 else b""
     if status >= 400:
@@ -133,6 +143,14 @@ async def generate(env: Any, db: Any, user_id: str, config: dict[str, Any], text
 
 
 async def batch(env: Any, db: Any, user_id: str, segments: list[dict[str, Any]], config: dict[str, Any], plan: dict[str, Any], idempotency_key: str | None = None) -> dict[str, Any]:
+    """Compatibility endpoint that never mixes or retains a full audio timeline.
+
+    Clients must write the returned per-segment WAVs locally and perform timeline
+    assembly with FFmpeg/Media3 on the device. This avoids a large Python list
+    exceeding the 128 MB Workers Free memory boundary.
+    """
+    if len(segments) > 20:
+        raise TtsProxyError("BATCH_TOO_LARGE", "Generate at most 20 segments per batch, or call /tts/generate per segment.", 422)
     cost = tts_cost(plan, sum(len(str(segment.get("text", ""))) for segment in segments))
     reference = idempotency_key or f"tts-batch:{uuid.uuid4()}"
     try:
@@ -141,21 +159,12 @@ async def batch(env: Any, db: Any, user_id: str, segments: list[dict[str, Any]],
         raise TtsProxyError("INSUFFICIENT_CREDITS", str(exc), 402) from exc
     try:
         results: list[dict[str, Any]] = []
-        max_end = max(int(segment.get("target_end_ms", 0)) for segment in segments)
-        canvas = [0] * max(1, int(max_end / 1000 * 48000) + 4800)
         for segment in segments:
-            raw, actual, rate = await synthesize(env, config, str(segment.get("text", "")))
-            if rate != 48000:
-                raise TtsProxyError("UNSUPPORTED_SAMPLE_RATE", "Modal VoxCPM2 must return 48 kHz audio.")
-            sample_rate, samples = _mono_pcm(raw)
-            fitted, actual_ms, fitted_ms, factor, overflow = _fit(samples, sample_rate, int(segment.get("target_duration_ms", 0)))
-            start = int(int(segment.get("target_start_ms", 0)) / 1000 * sample_rate)
-            end = min(len(canvas), start + len(fitted))
-            for index, sample in enumerate(fitted[:max(0, end - start)]):
-                canvas[start + index] = max(-32768, min(32767, canvas[start + index] + sample))
-            results.append({"id": segment.get("id"), "audio_base64": base64.b64encode(_wav(sample_rate, fitted)).decode("ascii"), "actual_duration_ms": actual_ms, "fitted_duration_ms": fitted_ms, "stretch_factor": factor, "overflow": overflow})
-        combined = _wav(48000, canvas)
-        return {"segments": results, "combined_audio_base64": base64.b64encode(combined).decode("ascii"), "total_duration_ms": int(len(canvas) / 48000 * 1000), "credits_charged": cost}
+            raw, actual_ms, rate = await synthesize(env, config, str(segment.get("text", "")))
+            target_ms = max(1, int(segment.get("target_duration_ms", actual_ms)))
+            factor = target_ms / max(1, actual_ms)
+            results.append({"id": segment.get("id"), "audio_base64": base64.b64encode(raw).decode("ascii"), "actual_duration_ms": actual_ms, "fitted_duration_ms": actual_ms, "stretch_factor": factor, "overflow": factor < 0.7 or factor > 1.5, "sample_rate": rate})
+        return {"segments": results, "combined_audio_base64": None, "total_duration_ms": max((int(item.get("target_end_ms", 0)) for item in segments), default=0), "credits_charged": cost, "assembly": "local_required"}
     except Exception:
         await add_credits(db, user_id, cost, "tts_batch_refund", reference_id=reference, description="Refund for failed batch TTS", idempotency_key=f"refund:{reference}")
         raise

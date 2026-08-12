@@ -1,5 +1,6 @@
 import sqlite3
 import sys
+import types
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -42,40 +43,19 @@ class D1:
         return Statement(self.conn, sql)
 
 
-class R2:
-    def __init__(self):
-        self.objects = {}
-
-    async def put(self, key, value, *args):
-        self.objects[key] = bytes(value)
-
-    async def delete(self, key):
-        self.objects.pop(key, None)
-
-
-class Queue:
-    def __init__(self):
-        self.messages = []
-
-    async def send(self, value, *args, **kwargs):
-        self.messages.append(value)
-
-
 class Env:
     JWT_SECRET = "local-test-jwt-secret-that-is-long-enough-32"
     JWT_ACCESS_TTL_SECONDS = "900"
     JWT_REFRESH_TTL_SECONDS = "2592000"
     GEMINI_MAX_AUDIO_BYTES = "150000000"
-    QUEUE_MAX_DEPTH = "500"
+    ACTIVE_REQUEST_MAX = "100"
+    PROVIDER_TIMEOUT_SECONDS = "900"
     FREE_DAILY_JOB_LIMIT = "3"
     ADMIN_EMAIL = "admin@example.com"
     ADMIN_PASSWORD = "correct horse battery staple"
 
     def __init__(self):
         self.DB = D1()
-        self.MEDIA = R2()
-        self.BACKUPS = R2()
-        self.JOB_QUEUE = Queue()
 
 
 class EnvMiddleware:
@@ -88,6 +68,15 @@ class EnvMiddleware:
 
 
 def test_cloudflare_core_lifecycle():
+    async def fake_transcribe_direct(env, audio, target_language, max_attempts=3):
+        assert audio == b"RIFF-fake-wave"
+        assert target_language == "my"
+        return ({"source_language": "en", "target_language": "my", "segments": [{"id": "s1", "start_ms": 0, "end_ms": 500, "original_text": "hello", "translated_text": "မင်္ဂလာပါ", "tts_text": "မင်္ဂလာပါ"}]}, {"id": "slot-local", "model": "gemini-2.5-flash"})
+
+    scheduler = types.ModuleType("scheduler")
+    scheduler.transcribe_direct = fake_transcribe_direct
+    original_scheduler = sys.modules.get("scheduler")
+    sys.modules["scheduler"] = scheduler
     env = Env()
     with TestClient(EnvMiddleware(main.app, env)) as client:
         registered = client.post("/api/v1/auth/register", json={"email": "admin@example.com", "password": "not-used-for-admin", "display_name": "Admin"})
@@ -104,11 +93,18 @@ def test_cloudflare_core_lifecycle():
         assert plan.json()["price_usdt"] == "1.25"
         job = client.post("/api/v1/transcribe", headers={**headers, "X-Target-Language": "my", "X-Video-Duration-Seconds": "61", "Idempotency-Key": "job-1", "Content-Type": "audio/wav"}, content=b"RIFF-fake-wave")
         assert job.status_code == 200, job.text
-        assert job.json()["status"] == "queued"
-        assert len(env.JOB_QUEUE.messages) == 1
+        assert job.json()["status"] == "completed"
+        assert job.json()["result"]["segments"][0]["translated_text"] == "မင်္ဂလာပါ"
         wallet = client.get("/api/v1/credits/balance", headers=headers).json()
         assert wallet["balance"] == 20
         duplicate = client.post("/api/v1/transcribe", headers={**headers, "X-Target-Language": "my", "X-Video-Duration-Seconds": "61", "Idempotency-Key": "job-1", "Content-Type": "audio/wav"}, content=b"second")
         assert duplicate.json()["job_id"] == job.json()["job_id"]
         imported = client.post("/api/v1/backup/import", headers=headers, json={"profile": {"email": "admin@example.com"}, "projects": [{"external_id": "local-1", "title": "Restored project", "target_language": "my"}]})
         assert imported.status_code == 200 and imported.json()["imported_projects"] == 1
+        exported = client.post("/api/v1/backup/export", headers=headers)
+        assert exported.status_code == 200
+        assert exported.json()["backup"]["media_retention"] == "none"
+    if original_scheduler is None:
+        del sys.modules["scheduler"]
+    else:
+        sys.modules["scheduler"] = original_scheduler

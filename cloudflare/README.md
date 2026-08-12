@@ -1,45 +1,41 @@
-# VoiceRecap Cloudflare Free-only Backend
+# VoiceRecap Cloudflare Free Backend
 
-This directory is a Cloudflare Python Worker deployment for VoiceRecap. It provides an authenticated FastAPI-compatible API, D1 state, R2 audio/backup storage, a Queue-backed fair transcription scheduler, credit-based plans, MMK/USDT payment order review, user backup/export, audit logging, and a browser admin panel at `/admin`.
+VoiceRecap uses this Cloudflare Python Worker as an **account and AI gateway**, not as a media storage service. It provides FastAPI-compatible authentication, D1 account state, credit plans priced in MMK/USDT, payment review, audit logs, browser administration at `/admin`, fair Gemini key scheduling, and a stateless Modal VoxCPM2 proxy.
 
-When deploying through **Workers Builds → Import a repository**, use the repository root (`/`) because the repository also contains a root `wrangler.jsonc`. Set the Build command to `npm run build` and the Deploy command to `npx wrangler deploy`. The build command runs `scripts/cloudflare-build.sh`; it uses `uvx --from workers-py pywrangler sync` in this directory and installs `uv` first only when `uvx` is not already available. Wrangler then deploys `cloudflare/src/entry.py`. The Worker name is `recapmaker--2727`, and it must match the Worker name in the dashboard.
+> **Local-media policy:** the Android app retains the source video, extracted WAV, clone-reference audio, generated TTS WAV, transcript, subtitles, and final MP4 on the user’s device. The Worker does not have an R2 binding, does not write audio/video to object storage, and does not accept an endpoint for uploading generated results.
 
-Cloudflare currently documents Python Workers and FastAPI support, but the Python runtime is still in open beta. The Worker is therefore intentionally isolated from the Android client contract and uses D1/R2/Queues bindings instead of Uvicorn, SQLAlchemy, or PostgreSQL. See `../CLOUDFLARE_DEPLOYMENT_NOTES.md` for the architecture rationale and Free-tier boundaries.
+When deploying through **Workers Builds → Import a repository**, use repository root (`/`). Set the build command to `npm run build` and deploy command to `npx wrangler deploy`. The root configuration deploys `cloudflare/src/entry.py` as Worker `recapmaker--2727`.
 
-## Local setup
+## Operational architecture
 
-Install Node.js, `uv`, and Wrangler. Then run:
-
-```bash
-cd cloudflare
-uv run pywrangler --version
-cp .dev.vars.example .dev.vars
-# edit .dev.vars with local-only values
-npx wrangler d1 migrations apply voicerecap-db --local
-uv run pywrangler dev
+```text
+Android local project workspace
+  ├─ source video / extracted WAV / reference voice / TTS WAV / output MP4
+  │
+  ├─ POST /transcribe: request-scoped WAV only
+  ▼
+Cloudflare Worker + D1
+  ├─ auth, plans, credits, payments, audit metadata
+  ├─ fair Gemini account/model slot selection
+  └─ stateless Modal VoxCPM2 relay
+       │
+       ├─ Gemini Files API: temporary upload, deleted in finally
+       └─ Modal: reference audio and generated WAV exist only in the request
 ```
 
-The Worker entrypoint is `src/entry.py`. `src/main.py` exposes the FastAPI routes, while `src/scheduler.py` is the Queue consumer. The queue message contains only a job ID; audio bytes are kept in R2.
+The Gemini Files API object is explicitly deleted after each transcription attempt. Clone reference audio is carried in the TTS request only and is never written to D1, R2, a queue, or a backup. The Android app must not submit generated WAV or MP4 files to the backend.
 
 ## Cloudflare provisioning
 
-Create the resources in the Cloudflare account that owns the Worker:
+Only a D1 database is needed. **Do not create R2 buckets or Queues for this version.** This removes the R2 activation error entirely.
 
 ```bash
 npx wrangler d1 create voicerecap-db
-npx wrangler r2 bucket create voicerecap-media
-npx wrangler r2 bucket create voicerecap-backups
-npx wrangler queues create voicerecap-jobs
-npx wrangler queues create voicerecap-dead-letter
-```
-
-Copy the returned D1 database ID into `wrangler.jsonc`. Keep the R2 bucket names and queue names consistent with that file. Apply the schema remotely:
-
-```bash
+# Copy the resulting database_id into both wrangler.jsonc files.
 npx wrangler d1 migrations apply voicerecap-db --remote
 ```
 
-Set secrets. Never put these values in `wrangler.jsonc`, D1, Git, or the APK:
+Set the Worker secrets. Never put secrets in Git, D1, Admin UI, or the Android APK.
 
 ```bash
 openssl rand -base64 48 | npx wrangler secret put JWT_SECRET
@@ -47,75 +43,57 @@ npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put GEMINI_KEY_1
 npx wrangler secret put GEMINI_KEY_2
 npx wrangler secret put GEMINI_KEY_3
-npx wrangler secret put MODAL_TTS_TOKEN
 ```
 
-Each Gemini slot created in the admin panel stores a non-secret binding name such as `GEMINI_KEY_1`. The corresponding Worker secret must exist. Multiple keys should represent genuinely separate Google projects/accounts when possible; keys from one project do not multiply Google project quota.
+The admin panel stores only a secret binding name, such as `GEMINI_KEY_1`, in each Gemini slot. The actual key remains a Cloudflare Worker secret. Use separate Google projects/accounts for keys when possible, because multiple keys in one Google project share that project’s quota.
 
-Deploy:
+Deploy with:
 
 ```bash
-uv run pywrangler deploy
+npm run build
+npx wrangler deploy
 ```
 
-The deployment URL is a `workers.dev` URL unless a custom domain is configured. Set the Android backend base URL to that URL with a trailing slash. The Worker must be deployed before the Android app is used against it.
+Set the Android backend base URL to the resulting `workers.dev` URL, including a trailing `/`.
 
-## First admin login
+## Timeout and reliability policy
 
-Set `ADMIN_EMAIL` in `wrangler.jsonc` and set the matching `ADMIN_PASSWORD` as a Worker secret. The administrator account is created or synchronized automatically on the first successful login; no bootstrap endpoint or one-time token is required.
+Cloudflare documents that HTTP-triggered Workers have no hard wall-clock duration while the client remains connected, and waiting on network I/O does not count toward CPU time. Workers Free remains constrained to 10 ms active CPU and 128 MB memory, so the Worker only relays requests and never performs video/audio rendering. [1]
 
-```bash
-npx wrangler secret put ADMIN_PASSWORD
-```
+| Boundary | Value | Behavior |
+|---|---:|---|
+| Android connection/write/read timeout | 30 s / 900 s / 900 s | A foreground WorkManager job retains the user-visible operation for up to 15 minutes. |
+| Worker provider timeout | 900 s | The Modal fetch is bounded at 15 minutes. A provider’s own shorter limit still applies. |
+| Gemini request | Client remains connected | Raw WAV stays only in Worker memory for the request; Gemini temporary file is deleted in a `finally` block. |
+| Retry | Gemini only, up to 3 attempts | Retry occurs only for retryable provider failures, with slot cooldown. |
+| TTS credit handling | Reserve then refund | Any failed Modal generation/batch refunds the reservation idempotently. |
 
-Open `https://YOUR_WORKER_URL/admin` and sign in with the configured email and environment password. The configured password is the source of truth; if it changes, the stored admin hash is synchronized on the next login. Add Gemini account/project/model slots after signing in. A slot has its own concurrency, RPM, and daily limits. The scheduler chooses the least-recently-used eligible slot, cools down provider failures, and runs one message per queue consumer invocation.
+A client disconnect can cancel in-flight Worker work. Android therefore uses an idempotency key per transcription project and persistent local project state. Retrying the same completed key returns the saved **transcript metadata** only; it does not retain any audio. The app should create a new idempotency key after a disconnected in-progress request, because the provider result may be unknown.
 
-## Credit plans and payment handling
+## First administrator login
 
-The admin panel can create plans with the following fields:
+Set `ADMIN_EMAIL` as a non-secret environment variable and `ADMIN_PASSWORD` as a secret. The administrator account is created or synchronized on its first successful login. No bootstrap token is used.
 
-| Field | Meaning |
-|---|---|
-| Included credits | Credits granted after an approved purchase or welcome grant |
-| Credits per video | Fixed base charge for one video |
-| Extra credits per minute | Optional duration-based charge, rounded up by minute |
-| TTS credits / 100 characters | Dubbing text charge |
-| Voice clone credits | Optional cloning charge |
-| Price MMK | Display and order amount in Myanmar kyat |
-| Price USDT | Display and order amount in USDT as a decimal string |
-| Validity days | Active plan duration; `0` means no expiry |
-| Max video seconds | Application-level media limit |
-
-The current payment boundary intentionally uses manual review. A user submits a MMK or USDT payment order and optional transaction reference/proof key; an administrator verifies the payment outside the Worker, then presses **Approve**. Approval is idempotent and grants included credits once. Automatic bank or blockchain settlement is not claimed by this Free-only package because it requires a provider-specific payment integration and credentials.
-
-Credit deductions are ledgered with an idempotency key. Failed queued transcription jobs refund the reserved credits. User backup import never restores credit balance, because allowing client-provided balance restoration would be an abuse vulnerability.
+Open `https://YOUR_WORKER_URL/admin`, sign in with the configured credentials, create plans, and configure Gemini slots. Slots use priority, concurrency, RPM, daily limit, cooldown, and least-recently-used selection so one busy API key does not block every user.
 
 ## API highlights
 
-| Route | Purpose |
-|---|---|
-| `POST /api/v1/auth/register` | Register and grant the configured Free-plan welcome credits |
-| `POST /api/v1/auth/login` | Issue access and refresh tokens |
-| `GET /api/v1/plans` | Public active plan list with MMK/USDT prices and credit rules |
-| `GET /api/v1/credits/balance` | Current credit wallet |
-| `POST /api/v1/transcribe` | Upload raw WAV, reserve credits, and enqueue one Gemini job |
-| `GET /api/v1/transcribe/{job_id}` | Poll queued/processing/completed/failed status |
-| `POST /api/v1/tts/generate` | Credit-aware Modal VoxCPM2 preview proxy |
-| `POST /api/v1/tts/batch` | Credit-aware Modal VoxCPM2 batch dubbing proxy |
-| `POST /api/v1/backup/export` | Write a user backup manifest and JSON object to R2 |
-| `POST /api/v1/backup/import` | Validate a user-owned backup without restoring credits |
-| `/api/v1/admin/*` | Admin dashboard APIs for users, plans, credits, payments, Gemini slots, jobs, and audit |
-| `GET /admin` | Browser admin panel |
-
-## Important Free-plan boundary
-
-The default Free Worker plan includes limited daily Worker requests and the Free Queue plan includes limited daily queue operations and 24-hour message retention. The API therefore returns `queued`, enforces a configurable queue-depth limit, and applies a Free daily job limit. It cannot promise unlimited simultaneous video processing. If demand exceeds the Cloudflare Free allocation, users see a controlled queue/full response instead of an uncontrolled provider rate-limit storm.
-
-For large-scale video import from YouTube/TikTok, native `yt-dlp` is not available inside a Python Worker. The current Cloudflare-only package accepts audio bytes from the Android local extraction path. URL import remains in the original FastAPI backend; a separate media-extraction service is required if URL import must also be Cloudflare-only.
+| Route | Purpose | Media retention |
+|---|---|---|
+| `POST /api/v1/auth/register` | Create account and apply eligible welcome credits | None |
+| `POST /api/v1/auth/login` | Issue access and refresh tokens | None |
+| `GET /api/v1/plans` | Active plans with MMK/USDT prices and credits | None |
+| `POST /api/v1/transcribe` | Receive request-scoped WAV, call Gemini, return completed transcript | No Worker storage; Gemini file deleted |
+| `GET /api/v1/transcribe/{job_id}` | Fetch transcript job metadata/result JSON | Transcript metadata only |
+| `POST /api/v1/tts/generate` | Proxy one Modal VoxCPM2 generation | No Worker storage |
+| `POST /api/v1/tts/batch` | Proxy dubbing segments and return WAV base64 | No Worker storage |
+| `POST /api/v1/backup/export` | Return metadata-only JSON for Android to save locally | No Worker storage |
+| `POST /api/v1/backup/import` | Import project metadata without restoring credits | No media accepted |
+| `/api/v1/admin/*` | Users, plans, credits, payments, Gemini slots, audit | Account metadata only |
 
 ## Android integration
 
-The Android app now lists admin-created credit plans with MMK and USDT prices, creates payment orders for manual review, and sends the extracted WAV as the request body with:
+The Android app selects a **target language before processing**, extracts audio locally, then calls `/api/v1/transcribe` with the WAV body and headers:
 
 ```text
 X-Target-Language: my
@@ -123,4 +101,14 @@ X-Video-Duration-Seconds: 73
 Idempotency-Key: project:<project-id>:transcription
 ```
 
-It polls the returned `job_id` until the fair queue completes, then writes Gemini `original_text`, translated `tts_text`, and timestamps into the existing Room transcript editor. The backend remains the only location that holds Gemini credentials. To build the Android APK for the deployed Worker, run `VOICERECAP_BACKEND_URL=https://YOUR_WORKER_URL/ ./gradlew assembleRelease` from the `android` directory.
+The direct response is normally `completed` with the structured transcript. The app writes the result to Room, keeps generated audio in its private project workspace, and writes the final MP4 through MediaStore under `Movies/VoiceRecap`. Clone reference audio is passed only when a user previews or exports clone TTS; it must be stored as a local URI, never in WorkManager input data as base64.
+
+Build with the deployed backend URL:
+
+```bash
+VOICERECAP_BACKEND_URL=https://YOUR_WORKER_URL/ ./gradlew assembleRelease
+```
+
+## References
+
+[1]: https://developers.cloudflare.com/workers/platform/limits/ "Cloudflare Workers limits"

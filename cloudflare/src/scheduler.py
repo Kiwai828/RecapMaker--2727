@@ -151,6 +151,36 @@ async def gemini_transcribe(api_key: str, model: str, audio: bytes, target_langu
         await delete_file(api_key, file_name)
 
 
+async def transcribe_direct(env: Any, audio: bytes, target_language: str, max_attempts: int = 3) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Transcribe request-scoped audio without writing it to R2 or a queue.
+
+    The caller keeps the HTTP connection open while this function waits on Gemini.
+    The audio byte string is released when this invocation returns or raises.
+    """
+    db = env.DB
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        slot = await choose_slot(db)
+        if not slot:
+            raise RuntimeError("no_gemini_slot_available")
+        try:
+            secret = getattr(env, slot["secret_name"], "")
+            if not secret:
+                raise RuntimeError("gemini_secret_missing")
+            result = await gemini_transcribe(str(secret), slot["model"], audio, target_language)
+            await release_slot(db, slot["id"])
+            return result, slot
+        except Exception as exc:
+            last_error = exc
+            text = str(exc)
+            retryable = any(str(code) in text for code in RETRYABLE_CODES) or "timeout" in text.lower() or "temporarily" in text.lower()
+            await release_slot(db, slot["id"], failed=True, cooldown_seconds=65 if retryable else 0)
+            if not retryable or attempt + 1 >= max_attempts:
+                raise
+            await asyncio.sleep(min(2 ** attempt, 4))
+    raise last_error or RuntimeError("gemini_transcription_failed")
+
+
 async def extract_object(body: Any) -> bytes:
     if hasattr(body, "arrayBuffer"):
         raw = await body.arrayBuffer()
