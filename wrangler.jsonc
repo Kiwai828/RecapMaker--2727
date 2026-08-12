@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "recapmaker--2727",
-  "main": "src/entry.py",
+  "main": "cloudflare/src/entry.py",
   "compatibility_date": "2026-08-12",
   "compatibility_flags": ["python_workers"],
   "workers_dev": true,
@@ -30,35 +30,22 @@
     {
       "binding": "DB",
       "database_name": "voicerecap-db",
-      "migrations_dir": "migrations"
+      "migrations_dir": "cloudflare/migrations"
     }
   ],
   "r2_buckets": [
-    {
-      "binding": "MEDIA",
-      "bucket_name": "voicerecap-media"
-    },
-    {
-      "binding": "BACKUPS",
-      "bucket_name": "voicerecap-backups"
-    }
+    { "binding": "MEDIA", "bucket_name": "voicerecap-media" },
+    { "binding": "BACKUPS", "bucket_name": "voicerecap-backups" }
   ],
   "queues": {
-    "producers": [
-      {
-        "binding": "JOB_QUEUE",
-        "queue": "voicerecap-jobs"
-      }
-    ],
-    "consumers": [
-      {
-        "queue": "voicerecap-jobs",
-        "max_batch_size": 1,
-        "max_batch_timeout": 1,
-        "max_retries": 3,
-        "dead_letter_queue": "voicerecap-dead-letter"
-      }
-    ]
+    "producers": [{ "binding": "JOB_QUEUE", "queue": "voicerecap-jobs" }],
+    "consumers": [{
+      "queue": "voicerecap-jobs",
+      "max_batch_size": 1,
+      "max_batch_timeout": 1,
+      "max_retries": 3,
+      "dead_letter_queue": "voicerecap-dead-letter"
+    }]
   },
   "secrets": {
     "required": ["JWT_SECRET", "ADMIN_PASSWORD"]

@@ -1,0 +1,13 @@
+.wrangler/
+node_modules/
+cloudflare/.dev.vars
+cloudflare/.env
+cloudflare/.venv/
+cloudflare/.venv-workers/
+cloudflare/python_modules/
+cloudflare/src/vendor/
+cloudflare/.wrangler/
+cloudflare/__pycache__/
+cloudflare/src/__pycache__/
+cloudflare/.pytest_cache/
+*.pyc
