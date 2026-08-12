@@ -1,0 +1,12 @@
+[project]
+name = "voicerecap-cloudflare"
+version = "1.0.0"
+description = "VoiceRecap Cloudflare Free-only backend"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0,<0.117.0",
+  "pydantic>=2.10,<3",
+]
+
+[dependency-groups]
+dev = ["workers-py"]

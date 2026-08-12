@@ -1,0 +1,14 @@
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+node_modules/
+.venv/
+.venv-workers/
+python_modules/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.sqlite
+
