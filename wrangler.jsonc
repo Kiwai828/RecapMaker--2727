@@ -9,9 +9,6 @@
     "enabled": true,
     "head_sampling_rate": 0.1
   },
-  "limits": {
-    "cpu_ms": 10
-  },
   "vars": {
     "APP_NAME": "VoiceRecap Cloudflare API",
     "JWT_ACCESS_TTL_SECONDS": "900",
