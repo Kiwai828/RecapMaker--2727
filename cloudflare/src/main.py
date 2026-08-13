@@ -665,9 +665,12 @@ async def admin_payment_approve(request: Request, order_id: str, admin: dict[str
 
 
 
-def _ai_model_public(row: dict[str, Any]) -> dict[str, Any]:
+def _ai_model_public(row: dict[str, Any], env: Any | None = None) -> dict[str, Any]:
     result = dict(row)
     result["enabled"] = bool(result.get("enabled"))
+    if env is not None:
+        secret_name = str(result.get("secret_name") or "")
+        result["secret_configured"] = bool(secret_name and getattr(env, secret_name, ""))
     result["catalog"] = loads(result.get("catalog_json") or "{}") or {}
     result.pop("catalog_json", None)
     return result
@@ -691,7 +694,7 @@ async def admin_ai_model_catalog(
 @app.get("/api/v1/admin/ai-models")
 async def admin_ai_models(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
     rows = await all_rows(db_of(request), "SELECT id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,active_requests,window_used,daily_used,cooldown_until,fail_count,last_used_at,catalog_json,last_catalog_at,created_at,updated_at FROM ai_provider_models ORDER BY capability,priority,provider,model_id")
-    return json_response([_ai_model_public(row) for row in rows])
+    return json_response([_ai_model_public(row, env_of(request)) for row in rows])
 
 
 @app.post("/api/v1/admin/ai-models")
@@ -704,7 +707,7 @@ async def admin_ai_model_create(request: Request, body: AiProviderModelBody, adm
     await run(db, "INSERT INTO ai_provider_models(id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,catalog_json,last_catalog_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", model_id, body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(catalog))
     await write_audit(db, admin["id"], "ai_model_created", "ai_provider_model", model_id, {"provider": body.provider, "capability": body.capability, "model_id": body.model_id, "secret_name": body.secret_name, "priority": body.priority})
     row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
-    return json_response(_ai_model_public(row or {}), status=201)
+    return json_response(_ai_model_public(row or {}, env_of(request)), status=201)
 
 
 @app.patch("/api/v1/admin/ai-models/{model_id}")
@@ -717,7 +720,27 @@ async def admin_ai_model_update(request: Request, model_id: str, body: AiProvide
     if not row:
         raise HTTPException(status_code=404, detail="AI model not found")
     await write_audit(db, admin["id"], "ai_model_updated", "ai_provider_model", model_id, {"provider": body.provider, "capability": body.capability, "model_id": body.model_id, "secret_name": body.secret_name, "priority": body.priority, "enabled": body.enabled})
-    return json_response(_ai_model_public(row))
+    return json_response(_ai_model_public(row, env_of(request)))
+
+
+@app.post("/api/v1/admin/ai-models/{model_id}/test")
+async def admin_ai_model_test(request: Request, model_id: str, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="AI model not found")
+    secret_name = str(row.get("secret_name") or "")
+    secret_configured = bool(secret_name and getattr(env_of(request), secret_name, ""))
+    from ai_providers import fetch_catalog
+    try:
+        catalog = await fetch_catalog(env_of(request), str(row["provider"]), secret_name)
+        match = next((item for item in catalog if item.get("model_id") == row["model_id"]), None)
+        result = {"ok": bool(secret_configured and match), "provider": row["provider"], "capability": row["capability"], "model_id": row["model_id"], "secret_configured": secret_configured, "catalog_reachable": True, "model_present_in_catalog": bool(match), "catalog_count": len(catalog), "catalog": match or {}}
+        await write_audit(db, admin["id"], "ai_model_tested", "ai_provider_model", model_id, {"provider": row["provider"], "model_id": row["model_id"], "secret_configured": secret_configured, "catalog_reachable": True, "model_present_in_catalog": bool(match)})
+        return json_response(result)
+    except Exception as exc:
+        status_code = int(getattr(exc, "status", 502) or 502)
+        return json_response({"ok": False, "provider": row["provider"], "capability": row["capability"], "model_id": row["model_id"], "secret_configured": secret_configured, "catalog_reachable": False, "error_code": str(getattr(exc, "code", "AI_PROVIDER_TEST_FAILED")), "error": str(exc)[:500]}, status=200)
 
 
 @app.delete("/api/v1/admin/ai-models/{model_id}")

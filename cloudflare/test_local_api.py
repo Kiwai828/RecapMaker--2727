@@ -77,6 +77,9 @@ def test_cloudflare_core_lifecycle():
 
     providers_module = types.ModuleType("ai_providers")
     providers_module.transcribe_and_translate = fake_transcribe_and_translate
+    async def fake_fetch_catalog(env, provider, secret_name):
+        raise RuntimeError("missing_provider_secret_for_test")
+    providers_module.fetch_catalog = fake_fetch_catalog
     original_providers = sys.modules.get("ai_providers")
     sys.modules["ai_providers"] = providers_module
     env = Env()
@@ -96,6 +99,9 @@ def test_cloudflare_core_lifecycle():
         ai_model_id = ai_model.json()["id"]
         ai_list = client.get("/api/v1/admin/ai-models", headers=headers)
         assert ai_list.status_code == 200 and ai_list.json()[0]["model_id"] == "openai/whisper-large-v3"
+        assert ai_list.json()[0]["secret_configured"] is False
+        ai_test = client.post(f"/api/v1/admin/ai-models/{ai_model_id}/test", headers=headers)
+        assert ai_test.status_code == 200 and ai_test.json()["ok"] is False and ai_test.json()["secret_configured"] is False
         update_payload = ai_model.json()
         update_payload["enabled"] = False
         update_payload["catalog"] = {"is_free": False}
