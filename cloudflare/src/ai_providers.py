@@ -424,7 +424,7 @@ async def gemini_translate(env: Any, segments: list[dict[str, Any]], target_lang
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max(512, min(12000, len(source) * 180))},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max(2048, min(32768, len(source) * 320)), "responseMimeType": "application/json"},
     }
     url = _gemini_generate_url(credential, str(model_row["model_id"]))
     status, data = await request_json(url, "POST", headers={"Accept": "application/json", "x-goog-api-key": api_key}, body=payload)
