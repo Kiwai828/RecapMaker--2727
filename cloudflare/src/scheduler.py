@@ -19,6 +19,35 @@ GEMINI_FILES_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
 
+
+class GeminiProviderError(RuntimeError):
+    """Provider failure with an HTTP status that can be mapped safely by the API."""
+
+    def __init__(self, stage: str, status: int, message: str = ""):
+        self.stage = stage
+        self.status = int(status)
+        self.provider_message = message[:500]
+        self.code = f"GEMINI_{stage.upper()}_{self.status}"
+        suffix = f":{self.provider_message}" if self.provider_message else ""
+        super().__init__(f"{self.code}{suffix}")
+
+
+class GeminiCapacityError(RuntimeError):
+    code = "GEMINI_CAPACITY"
+
+    def __init__(self, message: str = "All configured Gemini slots are temporarily busy"):
+        super().__init__(message)
+
+
+def provider_message(data: dict[str, Any]) -> str:
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("status") or "")
+    if isinstance(error, str):
+        return error
+    return str(data.get("message") or "") if isinstance(data, dict) else ""
+
+
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -75,7 +104,8 @@ async def upload_file(api_key: str, audio: bytes, mime_type: str, display_name: 
     }
     start = await fetch(GEMINI_FILES_UPLOAD_URL, to_js(start_options, dict_converter=Object.fromEntries))
     if int(start.status) not in {200, 201}:
-        raise RuntimeError(f"gemini_upload_start:{int(start.status)}")
+        data = await response_json(start)
+        raise GeminiProviderError("UPLOAD_START", int(start.status), provider_message(data))
     upload_url = str(start.headers.get("x-goog-upload-url"))
     if not upload_url:
         raise RuntimeError("gemini_upload_url_missing")
@@ -87,7 +117,8 @@ async def upload_file(api_key: str, audio: bytes, mime_type: str, display_name: 
     }
     uploaded = await fetch(upload_url, to_js(upload_options, dict_converter=Object.fromEntries))
     if int(uploaded.status) not in {200, 201}:
-        raise RuntimeError(f"gemini_upload_finalize:{int(uploaded.status)}")
+        data = await response_json(uploaded)
+        raise GeminiProviderError("UPLOAD_FINALIZE", int(uploaded.status), provider_message(data))
     data = await response_json(uploaded)
     file_data = data.get("file", data)
     return str(file_data["name"]), str(file_data["uri"])
@@ -98,7 +129,7 @@ async def file_uri(api_key: str, file_name: str, timeout_seconds: int = 180) -> 
     while time.monotonic() < deadline:
         status, data = await request_json(f"{GEMINI_FILES_API_URL}/{file_name}", "GET", headers={"x-goog-api-key": api_key})
         if status != 200:
-            raise RuntimeError(f"gemini_file_status:{status}")
+            raise GeminiProviderError("FILE_STATUS", status, provider_message(data))
         state = str(data.get("state") or data.get("file", {}).get("state") or "").upper()
         if state == "ACTIVE":
             return str(data.get("uri") or data.get("file", {}).get("uri"))
@@ -135,7 +166,7 @@ async def gemini_transcribe(api_key: str, model: str, audio: bytes, target_langu
  "mime_type": mime_type}], "response_format": {"type": "text", "mime_type": "application/json", "schema": RESPONSE_SCHEMA}, "store": False},
         )
         if status != 200:
-            raise RuntimeError(f"gemini_interaction:{status}")
+            raise GeminiProviderError("INTERACTION", status, provider_message(data))
         text = str(data.get("output_text") or "")
         if not text:
             for key in ("outputs", "steps"):
@@ -162,7 +193,7 @@ async def transcribe_direct(env: Any, audio: bytes, target_language: str, max_at
     for attempt in range(max_attempts):
         slot = await choose_slot(db)
         if not slot:
-            raise RuntimeError("no_gemini_slot_available")
+            raise GeminiCapacityError()
         try:
             secret = getattr(env, slot["secret_name"], "")
             if not secret:
@@ -173,11 +204,14 @@ async def transcribe_direct(env: Any, audio: bytes, target_language: str, max_at
         except Exception as exc:
             last_error = exc
             text = str(exc)
-            retryable = any(str(code) in text for code in RETRYABLE_CODES) or "timeout" in text.lower() or "temporarily" in text.lower()
+            provider_status = getattr(exc, "status", None)
+            retryable = (provider_status in RETRYABLE_CODES if provider_status is not None else any(str(code) in text for code in RETRYABLE_CODES)) or "timeout" in text.lower() or "temporarily" in text.lower()
             await release_slot(db, slot["id"], failed=True, cooldown_seconds=65 if retryable else 0)
             if not retryable or attempt + 1 >= max_attempts:
                 raise
-            await asyncio.sleep(min(2 ** attempt, 4))
+            # Do not hammer the same project/key after a provider 429. A
+            # longer jittered backoff gives the next configured slot a chance.
+            await asyncio.sleep(min(5 * (2 ** attempt), 20))
     raise last_error or RuntimeError("gemini_transcription_failed")
 
 

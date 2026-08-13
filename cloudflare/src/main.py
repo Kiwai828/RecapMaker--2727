@@ -462,10 +462,36 @@ async def create_transcription_job(
         return json_response({"job_id": job_id, "status": "completed", "poll_after_seconds": 0, "result": result, "provider_model": slot["model"]})
     except Exception as exc:
         text = str(exc)[:500]
-        await run(db, "UPDATE processing_jobs SET status='failed',error_code='GEMINI_FAILED',error_message=?,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", text, job_id)
+        error_code = str(getattr(exc, "code", "GEMINI_FAILED"))
+        await run(db, "UPDATE processing_jobs SET status='failed',error_code=?,error_message=?,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", error_code, text, job_id)
         await add_credits(db, user["id"], cost, "job_refund", reference_id=job_id, description="Refund for failed transcription", idempotency_key=f"refund:{job_id}")
-        if "no_gemini_slot_available" in text:
-            raise HTTPException(status_code=429, detail="All Gemini slots are busy. Please retry shortly.", headers={"Retry-After": "30"}) from exc
+
+        if exc.__class__.__name__ == "GeminiCapacityError" or error_code == "GEMINI_CAPACITY":
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "GEMINI_CAPACITY", "message": "All configured Gemini slots are temporarily busy. No duplicate request was created; retry after the suggested delay."},
+                headers={"Retry-After": "30"},
+            ) from exc
+
+        if hasattr(exc, "status") and hasattr(exc, "code") and str(error_code).startswith("GEMINI_"):
+            provider_status = int(exc.status)
+            if provider_status == 429:
+                raise HTTPException(
+                    status_code=429,
+                    detail={"code": "GEMINI_RATE_LIMIT", "message": "Gemini provider rate limit reached for this project/key. Reserved credits were refunded; wait before retrying."},
+                    headers={"Retry-After": "65"},
+                ) from exc
+            if provider_status in {408, 500, 502, 503, 504}:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "GEMINI_PROVIDER_TEMPORARY", "message": "Gemini is temporarily unavailable. Reserved credits were refunded; retry after the suggested delay."},
+                    headers={"Retry-After": "30"},
+                ) from exc
+            raise HTTPException(
+                status_code=502,
+                detail={"code": exc.code, "message": "Gemini rejected this model/request. Check the configured model ID and API key/project."},
+            ) from exc
+
         raise HTTPException(status_code=502, detail={"code": "GEMINI_FAILED", "message": "Gemini transcription failed; reserved credits were refunded."}) from exc
     finally:
         # Drop the only request-scoped media reference as soon as the call ends.
