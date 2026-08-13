@@ -40,6 +40,7 @@ class D1:
         self.conn.executescript((Path(__file__).parent / "migrations/0001_initial.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0002_ai_provider_models.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0003_retry_failed_jobs.sql").read_text())
+        self.conn.executescript((Path(__file__).parent / "migrations/0004_runtime_settings.sql").read_text())
 
     def prepare(self, sql):
         return Statement(self.conn, sql)
@@ -95,6 +96,10 @@ def test_cloudflare_core_lifecycle():
         admin_page = client.get("/admin")
         assert admin_page.status_code == 200 and "VoiceRecap Control Center" in admin_page.text
         assert "Fetch live models" in admin_page.text and "/api/v1/admin/ai-models/catalog" in admin_page.text
+        settings = client.get("/api/v1/admin/settings", headers=headers)
+        assert settings.status_code == 200 and settings.json()[0]["key"] == "free_daily_job_limit"
+        setting_update = client.patch("/api/v1/admin/settings/free_daily_job_limit", headers=headers, json={"key": "free_daily_job_limit", "value": 0})
+        assert setting_update.status_code == 200 and setting_update.json()["value"] == "0"
         ai_model = client.post("/api/v1/admin/ai-models", headers=headers, json={"provider": "openrouter_stt", "capability": "stt", "model_id": "openai/whisper-large-v3", "display_name": "Whisper Large V3", "secret_name": "OPENROUTER_API_KEY", "priority": 0, "enabled": True, "rpm_limit": 10, "daily_limit": 100, "concurrency_limit": 1, "catalog": {"is_free": False}})
         assert ai_model.status_code == 201, ai_model.text
         ai_model_id = ai_model.json()["id"]

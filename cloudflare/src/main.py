@@ -102,6 +102,11 @@ class AiCatalogQuery(BaseModel):
     secret_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
 
 
+class RuntimeSettingBody(BaseModel):
+    key: str = Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9_]*$")
+    value: int = Field(ge=0, le=10_000_000)
+
+
 class TtsGenerateBody(BaseModel):
     text: str = Field(min_length=1, max_length=20_000)
     voice_mode: str = Field(default="design", pattern="^(design|clone|ultimate_clone)$")
@@ -433,6 +438,19 @@ async def read_audio_bytes(request: Request) -> bytes:
     return data
 
 
+async def runtime_setting_int(db: Any, env: Any, key: str, default: int) -> int:
+    row = await first_row(db, "SELECT value FROM runtime_settings WHERE key=?", key)
+    if row:
+        try:
+            return max(0, int(row.get("value") or default))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0, int(getattr(env, "FREE_DAILY_JOB_LIMIT", default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @app.post("/api/v1/transcribe")
 async def create_transcription_job(
     request: Request,
@@ -460,8 +478,8 @@ async def create_transcription_job(
     # provider capacity, rate limits, DNS, or server errors must be refunded and
     # must not consume the user's daily allowance.
     jobs_today = await first_row(db, "SELECT COUNT(*) AS count FROM processing_jobs WHERE user_id=? AND status='completed' AND created_at>=date('now')", user["id"])
-    free_limit = int(getattr(env_of(request), "FREE_DAILY_JOB_LIMIT", "3"))
-    if plan.get("name") == "Free" and int((jobs_today or {}).get("count") or 0) >= free_limit:
+    free_limit = await runtime_setting_int(db, env_of(request), "free_daily_job_limit", 3)
+    if plan.get("name") == "Free" and free_limit > 0 and int((jobs_today or {}).get("count") or 0) >= free_limit:
         raise HTTPException(status_code=429, detail="Daily free processing limit reached")
     depth = await first_row(db, "SELECT COUNT(*) AS count FROM processing_jobs WHERE status IN ('queued','processing')")
     if int((depth or {}).get("count") or 0) >= int(getattr(env_of(request), "ACTIVE_REQUEST_MAX", "100")):
@@ -670,6 +688,25 @@ async def admin_payment_approve(request: Request, order_id: str, admin: dict[str
     await write_audit(db, admin["id"], "payment_approved", "payment_order", order_id, {"user_id": order["user_id"], "plan_id": plan["id"]})
     return json_response({"ok": True, "order_id": order_id, "plan": plan["name"]})
 
+
+
+@app.get("/api/v1/admin/settings")
+async def admin_settings(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
+    rows = await all_rows(db_of(request), "SELECT key,value,description,updated_by,updated_at FROM runtime_settings ORDER BY key")
+    return json_response(rows)
+
+
+@app.patch("/api/v1/admin/settings/{key}")
+async def admin_setting_update(request: Request, key: str, body: RuntimeSettingBody, admin: dict[str, Any] = Depends(admin_dep)):
+    if body.key != key:
+        raise HTTPException(status_code=400, detail="Setting key mismatch")
+    if key != "free_daily_job_limit":
+        raise HTTPException(status_code=400, detail="This runtime setting is not editable")
+    db = db_of(request)
+    await run(db, "INSERT INTO runtime_settings(key,value,description,updated_by,updated_at) VALUES(?,?,?,?,datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=datetime('now')", key, str(body.value), "Completed transcription jobs allowed per Free user per UTC day; 0 means unlimited", admin["id"])
+    await write_audit(db, admin["id"], "runtime_setting_updated", "runtime_setting", key, {"value": body.value})
+    row = await first_row(db, "SELECT key,value,description,updated_by,updated_at FROM runtime_settings WHERE key=?", key)
+    return json_response(row or {"key": key, "value": str(body.value)})
 
 
 def _ai_model_public(row: dict[str, Any], env: Any | None = None) -> dict[str, Any]:
