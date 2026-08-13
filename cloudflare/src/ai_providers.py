@@ -72,6 +72,17 @@ class AIProviderConfigurationError(RuntimeError):
     code = "AI_PROVIDER_CONFIGURATION"
 
 
+class AIProviderResponseError(ValueError):
+    code = "AI_PROVIDER_MALFORMED_RESPONSE"
+
+    def __init__(self, provider: str, message: str = "Provider returned incomplete or invalid translation JSON"):
+        self.provider = provider
+        self.stage = "TRANSLATION"
+        self.status = 502
+        self.provider_message = message
+        super().__init__(message)
+
+
 def py(value: Any) -> Any:
     return value.to_py() if hasattr(value, "to_py") else value
 
@@ -310,7 +321,7 @@ async def openrouter_transcribe(env: Any, audio: bytes, model_row: dict[str, Any
     return segments, {"provider": STT_PROVIDER, "model": model_row["model_id"], "row_id": model_row["id"], "source_language": str(data.get("language") or ""), "usage": data.get("usage") or {}}
 
 
-def _json_from_content(content: Any) -> dict[str, Any]:
+def _json_from_content(content: Any, provider: str = TRANSLATION_PROVIDER) -> dict[str, Any]:
     if isinstance(content, list):
         content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
     text = str(content or "").strip()
@@ -320,10 +331,21 @@ def _json_from_content(content: Any) -> dict[str, Any]:
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    parsed = json.loads(text.strip())
-    if not isinstance(parsed, dict):
-        raise ValueError("translation_response_not_object")
-    return parsed
+    text = text.strip()
+    decoder = json.JSONDecoder()
+    # Providers occasionally add a short preamble before the JSON object. Use
+    # raw_decode from each opening brace so a valid object can still be parsed,
+    # but never fabricate a result from an incomplete JSON string.
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise AIProviderResponseError(provider)
 
 
 async def custom_transcribe(env: Any, audio: bytes, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -365,8 +387,11 @@ async def zen_translate(env: Any, segments: list[dict[str, Any]], target_languag
     choices = data.get("choices") if isinstance(data.get("choices"), list) else []
     if not choices or not isinstance(choices[0], dict):
         raise ValueError("translation_response_choices_missing")
-    message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
-    parsed = _json_from_content(message.get("content"))
+    choice = choices[0]
+    if str(choice.get("finish_reason") or "").lower() in {"length", "max_tokens"}:
+        raise AIProviderResponseError(TRANSLATION_PROVIDER, "OpenCode translation response was truncated at the token limit")
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    parsed = _json_from_content(message.get("content"), TRANSLATION_PROVIDER)
     translated = parsed.get("segments")
     if not isinstance(translated, list):
         raise ValueError("translation_segments_missing")
@@ -406,9 +431,12 @@ async def gemini_translate(env: Any, segments: list[dict[str, Any]], target_lang
     if status != 200:
         raise AIProviderError(GEMINI_PROVIDER, "TRANSLATION", status, provider_message(data))
     candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
-    parts = ((candidates[0] or {}).get("content") or {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
+    candidate = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+    if str(candidate.get("finishReason") or "").upper() in {"MAX_TOKENS", "SAFETY", "RECITATION"}:
+        raise AIProviderResponseError(GEMINI_PROVIDER, f"Gemini translation response ended early: {candidate.get('finishReason')}")
+    parts = (candidate.get("content") or {}).get("parts", []) if isinstance(candidate.get("content"), dict) else []
     content = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
-    parsed = _json_from_content(content)
+    parsed = _json_from_content(content, GEMINI_PROVIDER)
     translated = parsed.get("segments")
     if not isinstance(translated, list):
         raise ValueError("translation_segments_missing")
@@ -441,7 +469,7 @@ async def custom_translate(env: Any, segments: list[dict[str, Any]], target_lang
         raise AIProviderError("custom", "TRANSLATION", status, provider_message(data))
     choices = data.get("choices") if isinstance(data.get("choices"), list) else []
     message = choices[0].get("message") if choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict) else {}
-    parsed = _json_from_content(message.get("content"))
+    parsed = _json_from_content(message.get("content"), "custom")
     translated = parsed.get("segments") if isinstance(parsed.get("segments"), list) else []
     by_id = {str(item.get("id")): item for item in translated if isinstance(item, dict) and item.get("id")}
     if any(s["id"] not in by_id for s in segments):

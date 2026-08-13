@@ -544,7 +544,10 @@ async def create_transcription_job(
         if error_code == "AI_PROVIDER_CAPACITY" or exc.__class__.__name__ == "AIProviderCapacityError":
             raise HTTPException(status_code=503, detail={"code": error_code, "message": "Configured transcription or translation models are temporarily busy. No duplicate request was created; try again later."}, headers={"Retry-After": "30"}) from exc
         if exc.__class__.__name__ == "AIProviderConfigurationError":
-            raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_CONFIGURATION", "message": "AI provider is not configured. Ask the administrator to enable one OpenRouter STT model and one OpenCode Zen translation model."}) from exc
+            raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_CONFIGURATION", "message": "AI provider is not configured. Ask the administrator to enable one OpenRouter STT model and one translation model from OpenCode Zen or Gemini."}) from exc
+        if str(getattr(exc, "code", "")) == "AI_PROVIDER_MALFORMED_RESPONSE":
+            metadata = {"provider": str(getattr(exc, "provider", "")), "stage": str(getattr(exc, "stage", "translation")).lower(), "model": str(getattr(exc, "model_id", ""))}
+            raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_MALFORMED_RESPONSE", **metadata, "message": "The provider returned incomplete or invalid translation JSON. The server tried the configured fallback models within this single request; credits were refunded."}) from exc
         if hasattr(exc, "status") and hasattr(exc, "provider"):
             provider_status = int(exc.status)
             provider = str(exc.provider)
