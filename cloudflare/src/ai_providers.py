@@ -314,7 +314,11 @@ async def _run_with_fallback(env: Any, capability: str, fn: Any) -> tuple[Any, d
             last_error = exc
             status = getattr(exc, "status", None)
             retryable = status in RETRYABLE_STATUS or isinstance(exc, (ValueError, json.JSONDecodeError))
-            await release_model(db, row["id"], failed=True, cooldown_seconds=65 if retryable else 0)
+            cooldown_seconds = 65 if retryable else 0
+            if isinstance(exc, AIProviderError):
+                exc.model_id = str(row.get("model_id") or "")
+                exc.cooldown_seconds = cooldown_seconds
+            await release_model(db, row["id"], failed=True, cooldown_seconds=cooldown_seconds)
             if not retryable:
                 continue
             await asyncio.sleep(1)

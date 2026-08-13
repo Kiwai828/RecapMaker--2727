@@ -516,10 +516,17 @@ async def create_transcription_job(
         if hasattr(exc, "status") and hasattr(exc, "provider"):
             provider_status = int(exc.status)
             provider = str(exc.provider)
+            stage = str(getattr(exc, "stage", "")).lower()
+            model_id = str(getattr(exc, "model_id", ""))
+            upstream_message = str(getattr(exc, "provider_message", ""))[:300]
+            cooldown_seconds = int(getattr(exc, "cooldown_seconds", 65) or 65)
+            metadata = {"provider": provider, "stage": stage, "model": model_id, "cooldown_seconds": cooldown_seconds}
+            if upstream_message:
+                metadata["upstream_message"] = upstream_message
             if provider_status == 429:
-                raise HTTPException(status_code=429, detail={"code": "AI_PROVIDER_RATE_LIMIT", "provider": provider, "message": "The selected AI provider rate limit was reached. The failed model is temporarily cooled down and credits were refunded; do not submit duplicate requests."}, headers={"Retry-After": "65"}) from exc
+                raise HTTPException(status_code=429, detail={"code": "AI_PROVIDER_RATE_LIMIT", **metadata, "message": f"{provider} {stage or 'AI'} model rate limit reached. The failed model is cooled down for about {cooldown_seconds} seconds; credits were refunded. Do not submit duplicate requests."}, headers={"Retry-After": str(cooldown_seconds)}) from exc
             if provider_status in {408, 500, 502, 503, 504}:
-                raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_TEMPORARY", "provider": provider, "message": "The selected AI provider is temporarily unavailable. Credits were refunded; retry later."}, headers={"Retry-After": "30"}) from exc
+                raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_TEMPORARY", **metadata, "message": f"{provider} {stage or 'AI'} model is temporarily unavailable. Credits were refunded; retry later."}, headers={"Retry-After": "30"}) from exc
             raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_REJECTED", "provider": provider, "message": "The configured model or API key was rejected. Choose a current model from the Admin model catalog and verify the secret binding."}) from exc
         raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_FAILED", "message": "Transcription or translation failed; reserved credits were refunded."}) from exc
     finally:
