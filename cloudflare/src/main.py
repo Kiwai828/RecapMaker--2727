@@ -233,6 +233,21 @@ async def ready(request: Request):
     return json_response({"status": "ready"})
 
 
+@app.get("/register-test", response_class=HTMLResponse)
+async def register_test_page():
+    return HTMLResponse("""
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>VoiceRecap connection test</title>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:32px auto;padding:0 18px;color:#202124}input,button{width:100%;box-sizing:border-box;padding:13px;margin:7px 0;font-size:16px;border-radius:8px}input{border:1px solid #9aa0a6}button{border:0;background:#6750a4;color:#fff;font-weight:600}pre{white-space:pre-wrap;word-break:break-word;background:#f1f3f4;padding:12px;border-radius:8px}</style></head>
+<body><h2>VoiceRecap browser connection test</h2><p>This page sends one same-origin POST to the production registration route. It is for diagnosing the mobile network path; do not use a real password.</p>
+<input id="email" type="email" autocomplete="off"><input id="password" type="password" value="BrowserTest123" autocomplete="off"><button id="send">Send registration POST</button><pre id="result">Ready</pre>
+<script>
+const result=document.getElementById('result');
+document.getElementById('email').value='browser-test-'+Date.now()+'@example.com';
+document.getElementById('send').onclick=async()=>{result.textContent='Sending...';try{const body={email:document.getElementById('email').value.trim().toLowerCase(),password:document.getElementById('password').value,display_name:'Browser Test'};const response=await fetch('/api/v1/register',{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)});const text=await response.text();result.textContent='HTTP '+response.status+'\\n'+text.replace(/access_token":"[^\"]+/g,'access_token":"REDACTED').replace(/refresh_token":"[^\"]+/g,'refresh_token":"REDACTED');}catch(error){result.textContent='FETCH_ERROR\\n'+error;}};
+</script></body></html>
+""", headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+
 @app.post("/api/v1/auth/register")
 @app.post("/api/v1/register")
 async def register(request: Request, body: RegisterBody):
