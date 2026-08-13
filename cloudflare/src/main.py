@@ -17,6 +17,7 @@ from auth import current_user, hash_password, issue_tokens, public_user, require
 from credits import CreditError, active_plan, add_credits, balance, ensure_account, video_cost
 from db import all_rows, dumps, first_row, loads, run
 from admin_page import ADMIN_HTML
+from credentials import encrypt_secret, masked_last4, public_credential
 from http_utils import error_response, json_body, json_response
 
 app = FastAPI(title="VoiceRecap Cloudflare API", version="2.0.0")
@@ -83,11 +84,12 @@ class SlotBody(BaseModel):
 
 class AiProviderModelBody(BaseModel):
     id: str | None = None
-    provider: str = Field(pattern="^(openrouter_stt|opencode_zen)$")
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
     capability: str = Field(pattern="^(stt|translation)$")
     model_id: str = Field(min_length=1, max_length=200)
     display_name: str | None = Field(default=None, max_length=200)
-    secret_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+    secret_name: str = Field(default="ADMIN_VAULT", min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+    credential_id: str | None = Field(default=None, max_length=100)
     priority: int = Field(default=0, ge=0, le=1000)
     enabled: bool = True
     rpm_limit: int = Field(default=10, ge=1, le=100_000)
@@ -97,9 +99,24 @@ class AiProviderModelBody(BaseModel):
 
 
 class AiCatalogQuery(BaseModel):
-    provider: str = Field(pattern="^(openrouter_stt|opencode_zen)$")
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
     capability: str = Field(pattern="^(stt|translation)$")
-    secret_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+    secret_name: str = Field(default="", max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+    credential_id: str | None = Field(default=None, max_length=100)
+
+
+class ProviderCredentialBody(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=100)
+    provider_type: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
+    api_key: str | None = Field(default=None, min_length=1, max_length=1000)
+    base_url: str | None = Field(default=None, max_length=500)
+    models_url: str | None = Field(default=None, max_length=500)
+    api_format: str = Field(default="openai_chat", pattern="^(openai_chat|openai_responses|openai_audio_transcription|anthropic_messages|custom_json)$")
+    auth_type: str = Field(default="bearer", pattern="^(bearer|x_api_key|query_param|none)$")
+    auth_header: str = Field(default="Authorization", max_length=100)
+    auth_query_name: str | None = Field(default=None, max_length=100)
+    enabled: bool = True
 
 
 class RuntimeSettingBody(BaseModel):
@@ -169,6 +186,21 @@ def env_of(request: Request) -> Any:
 
 def db_of(request: Request) -> Any:
     return env_of(request).DB
+
+
+def safe_provider_url(value: str | None, *, required: bool = False) -> str | None:
+    text = str(value or '').strip()
+    if not text:
+        if required:
+            raise HTTPException(status_code=422, detail='HTTPS provider URL is required')
+        return None
+    if not text.lower().startswith('https://'):
+        raise HTTPException(status_code=422, detail='Provider URLs must use HTTPS')
+    return text.rstrip('/')
+
+
+def provider_capability_valid(provider: str, capability: str) -> bool:
+    return provider == 'custom' or (provider, capability) in {('openrouter_stt', 'stt'), ('opencode_zen', 'translation')}
 
 
 def configured_admin_email(env: Any) -> str:
@@ -721,41 +753,104 @@ def _ai_model_public(row: dict[str, Any], env: Any | None = None) -> dict[str, A
     result["enabled"] = bool(result.get("enabled"))
     if env is not None:
         secret_name = str(result.get("secret_name") or "")
-        result["secret_configured"] = bool(secret_name and getattr(env, secret_name, ""))
+        result["secret_configured"] = bool(result.get("credential_configured") or (secret_name and getattr(env, secret_name, "")))
+    result["credential_configured"] = bool(result.get("credential_configured"))
     result["catalog"] = loads(result.get("catalog_json") or "{}") or {}
     result.pop("catalog_json", None)
     return result
 
 
+@app.get("/api/v1/admin/provider-credentials")
+async def admin_provider_credentials(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
+    rows = await all_rows(db_of(request), "SELECT id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_last4,enabled,created_at,updated_at,last_tested_at,last_test_status,last_test_message FROM ai_provider_credentials ORDER BY provider_type,name")
+    return json_response(rows)
+
+
+@app.post("/api/v1/admin/provider-credentials")
+async def admin_provider_credential_create(request: Request, body: ProviderCredentialBody, admin: dict[str, Any] = Depends(admin_dep)):
+    if body.provider_type == 'custom':
+        base_url = safe_provider_url(body.base_url, required=True)
+        models_url = safe_provider_url(body.models_url)
+    else:
+        base_url = safe_provider_url(body.base_url)
+        models_url = safe_provider_url(body.models_url)
+    if not body.api_key:
+        raise HTTPException(status_code=422, detail='api_key is required when creating a credential')
+    db = db_of(request)
+    credential_id = body.id or str(uuid.uuid4())
+    cipher = await encrypt_secret(env_of(request), body.api_key)
+    await run(db, "INSERT INTO ai_provider_credentials(id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_ciphertext,credential_last4,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", credential_id, body.name.strip(), body.provider_type, base_url, models_url, body.api_format, body.auth_type, body.auth_header.strip(), body.auth_query_name, cipher, masked_last4(body.api_key), int(body.enabled))
+    await write_audit(db, admin['id'], 'provider_credential_created', 'ai_provider_credential', credential_id, {'name': body.name.strip(), 'provider_type': body.provider_type, 'last4': masked_last4(body.api_key)})
+    row = await first_row(db, "SELECT id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_last4,enabled,created_at,updated_at,last_tested_at,last_test_status,last_test_message FROM ai_provider_credentials WHERE id=?", credential_id)
+    return json_response(row or {}, status=201)
+
+
+@app.patch("/api/v1/admin/provider-credentials/{credential_id}")
+async def admin_provider_credential_update(request: Request, credential_id: str, body: ProviderCredentialBody, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    existing = await first_row(db, "SELECT * FROM ai_provider_credentials WHERE id=?", credential_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail='Provider credential not found')
+    base_url = safe_provider_url(body.base_url)
+    models_url = safe_provider_url(body.models_url)
+    cipher = str(existing.get('credential_ciphertext') or '')
+    last4 = str(existing.get('credential_last4') or '')
+    if body.api_key:
+        cipher = await encrypt_secret(env_of(request), body.api_key)
+        last4 = masked_last4(body.api_key)
+    await run(db, "UPDATE ai_provider_credentials SET name=?,provider_type=?,base_url=?,models_url=?,api_format=?,auth_type=?,auth_header=?,auth_query_name=?,credential_ciphertext=?,credential_last4=?,enabled=?,updated_at=datetime('now') WHERE id=?", body.name.strip(), body.provider_type, base_url, models_url, body.api_format, body.auth_type, body.auth_header.strip(), body.auth_query_name, cipher, last4, int(body.enabled), credential_id)
+    await write_audit(db, admin['id'], 'provider_credential_updated', 'ai_provider_credential', credential_id, {'name': body.name.strip(), 'provider_type': body.provider_type, 'rotated': bool(body.api_key), 'last4': last4})
+    return json_response(await first_row(db, "SELECT id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_last4,enabled,created_at,updated_at,last_tested_at,last_test_status,last_test_message FROM ai_provider_credentials WHERE id=?", credential_id))
+
+
+@app.delete("/api/v1/admin/provider-credentials/{credential_id}")
+async def admin_provider_credential_delete(request: Request, credential_id: str, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    row = await first_row(db, "SELECT id,name,provider_type FROM ai_provider_credentials WHERE id=?", credential_id)
+    if not row:
+        raise HTTPException(status_code=404, detail='Provider credential not found')
+    await run(db, "UPDATE ai_provider_credentials SET enabled=0,credential_ciphertext='',updated_at=datetime('now') WHERE id=?", credential_id)
+    await run(db, "UPDATE ai_provider_models SET enabled=0,credential_id=NULL WHERE credential_id=?", credential_id)
+    await write_audit(db, admin['id'], 'provider_credential_deleted', 'ai_provider_credential', credential_id, row)
+    return json_response({'ok': True, 'id': credential_id})
+
+
 @app.get("/api/v1/admin/ai-models/catalog")
 async def admin_ai_model_catalog(
     request: Request,
-    provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen)$"),
+    provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen|custom)$"),
     capability: str = Query(..., pattern="^(stt|translation)$"),
-    secret_name: str = Query(..., min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
+    secret_name: str = Query(default="", max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
+    credential_id: str | None = Query(default=None, max_length=100),
     admin: dict[str, Any] = Depends(admin_dep),
 ):
-    if (provider, capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+    if not provider_capability_valid(provider, capability):
         raise HTTPException(status_code=422, detail="Provider and capability do not match")
     from ai_providers import fetch_catalog
-    models = await fetch_catalog(env_of(request), provider, secret_name)
+    models = await fetch_catalog(env_of(request), provider, secret_name, credential_id or "")
     return json_response({"provider": provider, "capability": capability, "models": models, "fetched_at": datetime.now(timezone.utc).isoformat()})
 
 
 @app.get("/api/v1/admin/ai-models")
 async def admin_ai_models(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
-    rows = await all_rows(db_of(request), "SELECT id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,active_requests,window_used,daily_used,cooldown_until,fail_count,last_used_at,catalog_json,last_catalog_at,created_at,updated_at FROM ai_provider_models ORDER BY capability,priority,provider,model_id")
+    rows = await all_rows(db_of(request), "SELECT m.id,m.provider,m.capability,m.model_id,m.display_name,m.secret_name,m.credential_id,CASE WHEN c.id IS NOT NULL AND c.enabled=1 AND c.credential_ciphertext LIKE 'enc:v1:%' THEN 1 ELSE 0 END AS credential_configured,m.priority,m.enabled,m.rpm_limit,m.daily_limit,m.concurrency_limit,m.active_requests,m.window_used,m.daily_used,m.cooldown_until,m.fail_count,m.last_used_at,m.catalog_json,m.last_catalog_at,m.created_at,m.updated_at FROM ai_provider_models m LEFT JOIN ai_provider_credentials c ON c.id=m.credential_id ORDER BY m.capability,m.priority,m.provider,m.model_id")
     return json_response([_ai_model_public(row, env_of(request)) for row in rows])
 
 
 @app.post("/api/v1/admin/ai-models")
 async def admin_ai_model_create(request: Request, body: AiProviderModelBody, admin: dict[str, Any] = Depends(admin_dep)):
-    if (body.provider, body.capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+    if not provider_capability_valid(body.provider, body.capability):
         raise HTTPException(status_code=422, detail="Provider and capability do not match")
     db = db_of(request)
+    if body.credential_id:
+        credential = await first_row(db, "SELECT id,provider_type,enabled FROM ai_provider_credentials WHERE id=?", body.credential_id)
+        if not credential or not credential.get('enabled'):
+            raise HTTPException(status_code=422, detail="Selected provider credential is unavailable")
+        if credential.get('provider_type') not in {body.provider, 'custom'} and body.provider != 'custom':
+            raise HTTPException(status_code=422, detail="Credential provider does not match model provider")
     model_id = body.id or str(uuid.uuid4())
     catalog = dict(body.catalog or {})
-    await run(db, "INSERT INTO ai_provider_models(id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,catalog_json,last_catalog_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", model_id, body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(catalog))
+    await run(db, "INSERT INTO ai_provider_models(id,provider,capability,model_id,display_name,secret_name,credential_id,priority,enabled,rpm_limit,daily_limit,concurrency_limit,catalog_json,last_catalog_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", model_id, body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.credential_id, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(catalog))
     await write_audit(db, admin["id"], "ai_model_created", "ai_provider_model", model_id, {"provider": body.provider, "capability": body.capability, "model_id": body.model_id, "secret_name": body.secret_name, "priority": body.priority})
     row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
     return json_response(_ai_model_public(row or {}, env_of(request)), status=201)
@@ -763,10 +858,16 @@ async def admin_ai_model_create(request: Request, body: AiProviderModelBody, adm
 
 @app.patch("/api/v1/admin/ai-models/{model_id}")
 async def admin_ai_model_update(request: Request, model_id: str, body: AiProviderModelBody, admin: dict[str, Any] = Depends(admin_dep)):
-    if (body.provider, body.capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+    if not provider_capability_valid(body.provider, body.capability):
         raise HTTPException(status_code=422, detail="Provider and capability do not match")
     db = db_of(request)
-    await run(db, "UPDATE ai_provider_models SET provider=?,capability=?,model_id=?,display_name=?,secret_name=?,priority=?,enabled=?,rpm_limit=?,daily_limit=?,concurrency_limit=?,catalog_json=?,last_catalog_at=datetime('now'),updated_at=datetime('now') WHERE id=?", body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(body.catalog or {}), model_id)
+    if body.credential_id:
+        credential = await first_row(db, "SELECT id,provider_type,enabled FROM ai_provider_credentials WHERE id=?", body.credential_id)
+        if not credential or not credential.get('enabled'):
+            raise HTTPException(status_code=422, detail="Selected provider credential is unavailable")
+        if credential.get('provider_type') not in {body.provider, 'custom'} and body.provider != 'custom':
+            raise HTTPException(status_code=422, detail="Credential provider does not match model provider")
+    await run(db, "UPDATE ai_provider_models SET provider=?,capability=?,model_id=?,display_name=?,secret_name=?,credential_id=?,priority=?,enabled=?,rpm_limit=?,daily_limit=?,concurrency_limit=?,catalog_json=?,last_catalog_at=datetime('now'),updated_at=datetime('now') WHERE id=?", body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.credential_id, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(body.catalog or {}), model_id)
     row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
     if not row:
         raise HTTPException(status_code=404, detail="AI model not found")
@@ -781,12 +882,14 @@ async def admin_ai_model_test(request: Request, model_id: str, admin: dict[str, 
     if not row:
         raise HTTPException(status_code=404, detail="AI model not found")
     secret_name = str(row.get("secret_name") or "")
-    secret_configured = bool(secret_name and getattr(env_of(request), secret_name, ""))
+    credential_id = str(row.get("credential_id") or "")
+    credential = await first_row(db, "SELECT id,credential_ciphertext,enabled FROM ai_provider_credentials WHERE id=?", credential_id) if credential_id else None
+    secret_configured = bool((credential and credential.get('enabled') and str(credential.get('credential_ciphertext') or '').startswith('enc:v1:')) or (secret_name and getattr(env_of(request), secret_name, "")))
     from ai_providers import fetch_catalog
     try:
-        catalog = await fetch_catalog(env_of(request), str(row["provider"]), secret_name)
+        catalog = await fetch_catalog(env_of(request), str(row["provider"]), secret_name, credential_id)
         match = next((item for item in catalog if item.get("model_id") == row["model_id"]), None)
-        result = {"ok": bool(secret_configured and match), "provider": row["provider"], "capability": row["capability"], "model_id": row["model_id"], "secret_configured": secret_configured, "catalog_reachable": True, "model_present_in_catalog": bool(match), "catalog_count": len(catalog), "catalog": match or {}}
+        result = {"ok": bool(secret_configured and match), "provider": row["provider"], "capability": row["capability"], "model_id": row["model_id"], "credential_id": credential_id or None, "secret_configured": secret_configured, "catalog_reachable": True, "model_present_in_catalog": bool(match), "catalog_count": len(catalog), "catalog": match or {}}
         await write_audit(db, admin["id"], "ai_model_tested", "ai_provider_model", model_id, {"provider": row["provider"], "model_id": row["model_id"], "secret_configured": secret_configured, "catalog_reachable": True, "model_present_in_catalog": bool(match)})
         return json_response(result)
     except Exception as exc:

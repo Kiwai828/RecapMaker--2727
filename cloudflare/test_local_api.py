@@ -41,6 +41,7 @@ class D1:
         self.conn.executescript((Path(__file__).parent / "migrations/0002_ai_provider_models.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0003_retry_failed_jobs.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0004_runtime_settings.sql").read_text())
+        self.conn.executescript((Path(__file__).parent / "migrations/0005_provider_credentials.sql").read_text())
 
     def prepare(self, sql):
         return Statement(self.conn, sql)
@@ -79,7 +80,7 @@ def test_cloudflare_core_lifecycle():
 
     providers_module = types.ModuleType("ai_providers")
     providers_module.transcribe_and_translate = fake_transcribe_and_translate
-    async def fake_fetch_catalog(env, provider, secret_name):
+    async def fake_fetch_catalog(env, provider, secret_name="", credential_id=""):
         raise RuntimeError("missing_provider_secret_for_test")
     providers_module.fetch_catalog = fake_fetch_catalog
     original_providers = sys.modules.get("ai_providers")
@@ -140,3 +141,55 @@ def test_cloudflare_core_lifecycle():
         del sys.modules["ai_providers"]
     else:
         sys.modules["ai_providers"] = original_providers
+
+
+def test_admin_encrypted_credential_and_custom_model_routes():
+    async def fake_encrypt_secret(env, value):
+        return f"enc:v1:test:{value}"
+
+    original_encrypt = main.encrypt_secret
+    main.encrypt_secret = fake_encrypt_secret
+    env = Env()
+    try:
+        with TestClient(EnvMiddleware(main.app, env)) as client:
+            login = client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "correct horse battery staple"})
+            assert login.status_code == 200, login.text
+            headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            credential = client.post("/api/v1/admin/provider-credentials", headers=headers, json={
+                "name": "Custom translation gateway",
+                "provider_type": "custom",
+                "api_key": "secret-value-1234",
+                "base_url": "https://example.test/v1",
+                "models_url": "https://example.test/v1/models",
+                "api_format": "openai_chat",
+                "auth_type": "bearer",
+                "auth_header": "Authorization",
+                "enabled": True,
+            })
+            assert credential.status_code == 201, credential.text
+            assert credential.json()["credential_last4"] == "1234"
+            assert "credential_ciphertext" not in credential.json()
+            credential_id = credential.json()["id"]
+            rows = client.get("/api/v1/admin/provider-credentials", headers=headers)
+            assert rows.status_code == 200 and rows.json()[0]["id"] == credential_id
+            custom_model = client.post("/api/v1/admin/ai-models", headers=headers, json={
+                "provider": "custom", "capability": "translation", "model_id": "example-model",
+                "display_name": "Example model", "secret_name": "ADMIN_VAULT", "credential_id": credential_id,
+                "priority": 1, "enabled": True, "rpm_limit": 5, "daily_limit": 20, "concurrency_limit": 1,
+                "catalog": {"model_id": "example-model"},
+            })
+            assert custom_model.status_code == 201, custom_model.text
+            assert custom_model.json()["credential_id"] == credential_id
+            disabled = client.delete(f"/api/v1/admin/provider-credentials/{credential_id}", headers=headers)
+            assert disabled.status_code == 200
+            model_rows = client.get("/api/v1/admin/ai-models", headers=headers)
+            assert model_rows.status_code == 200
+            assert model_rows.json()[0]["enabled"] is False
+    finally:
+        main.encrypt_secret = original_encrypt
+
+
+if __name__ == "__main__":
+    test_cloudflare_core_lifecycle()
+    test_admin_encrypted_credential_and_custom_model_routes()
+    print("local API tests passed")

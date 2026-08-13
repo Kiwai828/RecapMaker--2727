@@ -11,6 +11,7 @@ from js import Object, fetch
 from pyodide.ffi import to_js
 
 from db import all_rows, first_row, run
+from credentials import resolve_credential
 
 OPENROUTER_STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=transcription"
@@ -110,8 +111,48 @@ def _secret(env: Any, secret_name: str) -> str:
     return str(getattr(env, secret_name, "") or "")
 
 
-def _auth_headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}", "Accept": "application/json"} if api_key else {"Accept": "application/json"}
+def _auth_headers(api_key: str, credential: dict[str, Any] | None = None) -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if not api_key:
+        return headers
+    row = credential or {}
+    auth_type = str(row.get("auth_type") or "bearer")
+    auth_header = str(row.get("auth_header") or "Authorization")
+    if auth_type == "x_api_key":
+        headers[auth_header] = api_key
+    elif auth_type == "none":
+        pass
+    else:
+        headers[auth_header] = f"Bearer {api_key}"
+    return headers
+
+
+async def _model_secret(env: Any, model_row: dict[str, Any]) -> str:
+    value, _ = await resolve_credential(
+        env,
+        env.DB,
+        credential_id=str(model_row.get("credential_id") or "") or None,
+        legacy_secret_name=str(model_row.get("secret_name") or "") or None,
+    )
+    return value
+
+
+async def _model_credential(env: Any, model_row: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    return await resolve_credential(
+        env,
+        env.DB,
+        credential_id=str(model_row.get("credential_id") or "") or None,
+        legacy_secret_name=str(model_row.get("secret_name") or "") or None,
+    )
+
+
+def _credential_url(row: dict[str, Any] | None, suffix: str) -> str:
+    base = str((row or {}).get("base_url") or "").rstrip("/")
+    if not base:
+        return ""
+    if base.endswith(suffix):
+        return base
+    return base + suffix
 
 
 def _catalog_item(provider: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -136,18 +177,21 @@ def _catalog_item(provider: str, item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def fetch_catalog(env: Any, provider: str, secret_name: str = "") -> list[dict[str, Any]]:
+async def fetch_catalog(env: Any, provider: str, secret_name: str = "", credential_id: str = "") -> list[dict[str, Any]]:
+    api_key, credential = await resolve_credential(env, env.DB, credential_id=credential_id or None, legacy_secret_name=secret_name or None)
     if provider == STT_PROVIDER:
-        url = OPENROUTER_MODELS_URL
-        api_key = _secret(env, secret_name)
+        url = str((credential or {}).get("models_url") or OPENROUTER_MODELS_URL)
     elif provider == TRANSLATION_PROVIDER:
-        url = ZEN_MODELS_URL
-        api_key = _secret(env, secret_name)
-        if not api_key:
-            raise AIProviderConfigurationError("An OpenCode Zen secret binding name and configured secret are required to fetch its catalog")
+        url = str((credential or {}).get("models_url") or ZEN_MODELS_URL)
+    elif provider == "custom":
+        url = str((credential or {}).get("models_url") or _credential_url(credential, "/models"))
+        if not url:
+            raise AIProviderConfigurationError("Custom provider requires a model catalog URL or base URL")
     else:
         raise AIProviderConfigurationError(f"Unsupported provider: {provider}")
-    status, data = await request_json(url, headers=_auth_headers(api_key))
+    if provider == TRANSLATION_PROVIDER and not api_key:
+        raise AIProviderConfigurationError("An OpenCode Zen credential or legacy secret binding is required to fetch its catalog")
+    status, data = await request_json(url, headers=_auth_headers(api_key, credential))
     if status != 200:
         raise AIProviderError(provider, "CATALOG", status, provider_message(data))
     raw = data.get("data") if isinstance(data.get("data"), list) else data.get("models")
@@ -221,7 +265,7 @@ def _stt_segments(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def openrouter_transcribe(env: Any, audio: bytes, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    api_key = _secret(env, str(model_row.get("secret_name") or ""))
+    api_key = await _model_secret(env, model_row)
     if not api_key:
         raise AIProviderConfigurationError(f"Missing configured secret binding: {model_row.get('secret_name')}")
     payload = {
@@ -253,8 +297,22 @@ def _json_from_content(content: Any) -> dict[str, Any]:
     return parsed
 
 
+async def custom_transcribe(env: Any, audio: bytes, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    api_key, credential = await _model_credential(env, model_row)
+    if not api_key or not credential:
+        raise AIProviderConfigurationError("Custom provider credential is not configured")
+    url = _credential_url(credential, "/audio/transcriptions")
+    if not url:
+        raise AIProviderConfigurationError("Custom transcription provider requires a base URL")
+    payload = {"model": str(model_row["model_id"]), "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": "wav"}, "response_format": "verbose_json", "timestamp_granularities": ["segment"]}
+    status, data = await request_json(url, "POST", headers=_auth_headers(api_key, credential), body=payload)
+    if status != 200:
+        raise AIProviderError("custom", "TRANSCRIPTION", status, provider_message(data))
+    return _stt_segments(data), {"provider": "custom", "model": model_row["model_id"], "row_id": model_row["id"], "source_language": str(data.get("language") or ""), "usage": data.get("usage") or {}}
+
+
 async def zen_translate(env: Any, segments: list[dict[str, Any]], target_language: str, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    api_key = _secret(env, str(model_row.get("secret_name") or ""))
+    api_key = await _model_secret(env, model_row)
     if not api_key:
         raise AIProviderConfigurationError(f"Missing configured secret binding: {model_row.get('secret_name')}")
     source = [{"id": s["id"], "original_text": s["original_text"]} for s in segments]
@@ -297,6 +355,37 @@ async def zen_translate(env: Any, segments: list[dict[str, Any]], target_languag
     return merged, {"provider": TRANSLATION_PROVIDER, "model": model_row["model_id"], "row_id": model_row["id"], "usage": data.get("usage") or {}}
 
 
+async def custom_translate(env: Any, segments: list[dict[str, Any]], target_language: str, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    api_key, credential = await _model_credential(env, model_row)
+    if not api_key or not credential:
+        raise AIProviderConfigurationError("Custom provider credential is not configured")
+    url = _credential_url(credential, "/chat/completions")
+    if not url:
+        raise AIProviderConfigurationError("Custom translation provider requires a base URL")
+    source = [{"id": s["id"], "original_text": s["original_text"]} for s in segments]
+    system = 'Translate every segment faithfully. Return ONLY JSON with this shape: {"segments":[{"id":"same id","translated_text":"translation","tts_text":"spoken dubbing text"}]}'
+    payload = {"model": str(model_row["model_id"]), "temperature": 0.1, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps({"target_language": target_language, "segments": source}, ensure_ascii=False)}], "max_tokens": max(512, min(12000, len(source) * 180))}
+    status, data = await request_json(url, "POST", headers=_auth_headers(api_key, credential), body=payload)
+    if status != 200:
+        raise AIProviderError("custom", "TRANSLATION", status, provider_message(data))
+    choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+    message = choices[0].get("message") if choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict) else {}
+    parsed = _json_from_content(message.get("content"))
+    translated = parsed.get("segments") if isinstance(parsed.get("segments"), list) else []
+    by_id = {str(item.get("id")): item for item in translated if isinstance(item, dict) and item.get("id")}
+    if any(s["id"] not in by_id for s in segments):
+        raise ValueError("translation_segment_count_mismatch")
+    merged = []
+    for segment in segments:
+        item = by_id[segment["id"]]
+        translated_text = str(item.get("translated_text") or "").strip()
+        tts_text = str(item.get("tts_text") or translated_text).strip()
+        if not translated_text or not tts_text:
+            raise ValueError("translation_segment_empty")
+        merged.append({**segment, "translated_text": translated_text, "tts_text": tts_text})
+    return merged, {"provider": "custom", "model": model_row["model_id"], "row_id": model_row["id"], "usage": data.get("usage") or {}}
+
+
 async def _run_with_fallback(env: Any, capability: str, fn: Any) -> tuple[Any, dict[str, Any]]:
     db = env.DB
     attempted: set[str] = set()
@@ -328,8 +417,12 @@ async def _run_with_fallback(env: Any, capability: str, fn: Any) -> tuple[Any, d
 
 
 async def transcribe_and_translate(env: Any, audio: bytes, target_language: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    segments, stt_meta = await _run_with_fallback(env, "stt", lambda row: openrouter_transcribe(env, audio, row))
-    translated, translation_meta = await _run_with_fallback(env, "translation", lambda row: zen_translate(env, segments, target_language, row))
+    async def run_stt(row: dict[str, Any]):
+        return await (custom_transcribe(env, audio, row) if row.get("provider") == "custom" else openrouter_transcribe(env, audio, row))
+    async def run_translation(row: dict[str, Any]):
+        return await (custom_translate(env, segments, target_language, row) if row.get("provider") == "custom" else zen_translate(env, segments, target_language, row))
+    segments, stt_meta = await _run_with_fallback(env, "stt", run_stt)
+    translated, translation_meta = await _run_with_fallback(env, "translation", run_translation)
     result = {
         "source_language": str(stt_meta.get("source_language") or ""),
         "target_language": target_language,

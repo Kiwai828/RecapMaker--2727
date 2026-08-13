@@ -32,6 +32,6 @@
     }
   ],
   "secrets": {
-    "required": ["JWT_SECRET", "ADMIN_PASSWORD", "OPENROUTER_API_KEY", "OPENCODE_ZEN_KEY_1"]
+    "required": ["JWT_SECRET", "ADMIN_PASSWORD", "PROVIDER_CREDENTIAL_MASTER_KEY"]
   }
 }
