@@ -778,7 +778,14 @@ async def admin_provider_credential_create(request: Request, body: ProviderCrede
         raise HTTPException(status_code=422, detail='api_key is required when creating a credential')
     db = db_of(request)
     credential_id = body.id or str(uuid.uuid4())
-    cipher = await encrypt_secret(env_of(request), body.api_key)
+    try:
+        cipher = await encrypt_secret(env_of(request), body.api_key)
+    except ValueError as exc:
+        # Configuration errors such as a missing/short master key are actionable
+        # and should not be hidden behind the generic middleware 500 response.
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "60"}) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail={"code": "CREDENTIAL_VAULT_UNAVAILABLE", "message": str(exc)}, headers={"Retry-After": "60"}) from exc
     await run(db, "INSERT INTO ai_provider_credentials(id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_ciphertext,credential_last4,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", credential_id, body.name.strip(), body.provider_type, base_url, models_url, body.api_format, body.auth_type, body.auth_header.strip(), body.auth_query_name, cipher, masked_last4(body.api_key), int(body.enabled))
     await write_audit(db, admin['id'], 'provider_credential_created', 'ai_provider_credential', credential_id, {'name': body.name.strip(), 'provider_type': body.provider_type, 'last4': masked_last4(body.api_key)})
     row = await first_row(db, "SELECT id,name,provider_type,base_url,models_url,api_format,auth_type,auth_header,auth_query_name,credential_last4,enabled,created_at,updated_at,last_tested_at,last_test_status,last_test_message FROM ai_provider_credentials WHERE id=?", credential_id)
@@ -796,7 +803,12 @@ async def admin_provider_credential_update(request: Request, credential_id: str,
     cipher = str(existing.get('credential_ciphertext') or '')
     last4 = str(existing.get('credential_last4') or '')
     if body.api_key:
-        cipher = await encrypt_secret(env_of(request), body.api_key)
+        try:
+            cipher = await encrypt_secret(env_of(request), body.api_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "60"}) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail={"code": "CREDENTIAL_VAULT_UNAVAILABLE", "message": str(exc)}, headers={"Retry-After": "60"}) from exc
         last4 = masked_last4(body.api_key)
     await run(db, "UPDATE ai_provider_credentials SET name=?,provider_type=?,base_url=?,models_url=?,api_format=?,auth_type=?,auth_header=?,auth_query_name=?,credential_ciphertext=?,credential_last4=?,enabled=?,updated_at=datetime('now') WHERE id=?", body.name.strip(), body.provider_type, base_url, models_url, body.api_format, body.auth_type, body.auth_header.strip(), body.auth_query_name, cipher, last4, int(body.enabled), credential_id)
     await write_audit(db, admin['id'], 'provider_credential_updated', 'ai_provider_credential', credential_id, {'name': body.name.strip(), 'provider_type': body.provider_type, 'rotated': bool(body.api_key), 'last4': last4})

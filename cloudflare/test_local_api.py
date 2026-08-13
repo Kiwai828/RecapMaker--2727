@@ -189,6 +189,29 @@ def test_admin_encrypted_credential_and_custom_model_routes():
         main.encrypt_secret = original_encrypt
 
 
+def test_admin_credential_route_surfaces_vault_configuration_error():
+    async def missing_master_key(env, value):
+        raise ValueError("PROVIDER_CREDENTIAL_MASTER_KEY must be configured with at least 32 characters")
+
+    original_encrypt = main.encrypt_secret
+    main.encrypt_secret = missing_master_key
+    env = Env()
+    try:
+        with TestClient(EnvMiddleware(main.app, env)) as client:
+            login = client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "correct horse battery staple"})
+            assert login.status_code == 200, login.text
+            headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            response = client.post("/api/v1/admin/provider-credentials", headers=headers, json={
+                "name": "Should fail clearly", "provider_type": "openrouter_stt", "api_key": "secret-value-1234",
+                "api_format": "openai_audio_transcription", "auth_type": "bearer", "auth_header": "Authorization",
+                "enabled": True,
+            })
+            assert response.status_code == 503, response.text
+            assert "PROVIDER_CREDENTIAL_MASTER_KEY" in str(response.json()["detail"])
+    finally:
+        main.encrypt_secret = original_encrypt
+
+
 if __name__ == "__main__":
     test_cloudflare_core_lifecycle()
     test_admin_encrypted_credential_and_custom_model_routes()

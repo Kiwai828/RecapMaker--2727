@@ -13,13 +13,22 @@ from typing import Any
 
 try:
     import js
+    from js import Object
 except ImportError:  # local unit-test fallback; WebCrypto is only used in Workers
     js = None
+    Object = None
 try:
     from pyodide.ffi import to_js
 except ImportError:  # local unit-test fallback
     def to_js(value: Any, **kwargs: Any) -> Any:
         return value
+
+
+def _js(value: Any) -> Any:
+    """Convert Python containers to JavaScript objects for Pyodide FFI calls."""
+    if js is None or Object is None:
+        return value
+    return to_js(value, dict_converter=Object.fromEntries)
 
 from db import first_row
 
@@ -31,7 +40,7 @@ def _u8(data: bytes) -> Any:
     if js is None:
         raise RuntimeError("WebCrypto is available only in the Cloudflare Worker runtime")
     array_type = getattr(js, "Uint8Array")
-    return getattr(array_type, "from")(to_js(list(data)))
+    return getattr(array_type, "from")(_js(list(data)))
 
 
 def _bytes(value: Any) -> bytes:
@@ -50,9 +59,9 @@ async def _key(env: Any) -> Any:
     return await webcrypto.subtle.importKey(
         "raw",
         _u8(digest),
-        {"name": "AES-GCM"},
+        _js({"name": "AES-GCM"}),
         False,
-        ["encrypt", "decrypt"],
+        _js(["encrypt", "decrypt"]),
     )
 
 
@@ -65,7 +74,7 @@ async def encrypt_secret(env: Any, plaintext: str) -> str:
         raise RuntimeError("WebCrypto is available only in the Cloudflare Worker runtime")
     webcrypto = getattr(js, "crypto")
     encrypted = await webcrypto.subtle.encrypt(
-        {"name": "AES-GCM", "iv": _u8(iv_bytes)},
+        _js({"name": "AES-GCM", "iv": _u8(iv_bytes)}),
         key,
         _u8(plaintext.encode("utf-8")),
     )
@@ -86,7 +95,7 @@ async def decrypt_secret(env: Any, ciphertext: str) -> str:
         raise RuntimeError("WebCrypto is available only in the Cloudflare Worker runtime")
     webcrypto = getattr(js, "crypto")
     plaintext = await webcrypto.subtle.decrypt(
-        {"name": "AES-GCM", "iv": _u8(iv)},
+        _js({"name": "AES-GCM", "iv": _u8(iv)}),
         key,
         _u8(encrypted),
     )
