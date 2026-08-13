@@ -42,6 +42,7 @@ class D1:
         self.conn.executescript((Path(__file__).parent / "migrations/0003_retry_failed_jobs.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0004_runtime_settings.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0005_provider_credentials.sql").read_text())
+        self.conn.executescript((Path(__file__).parent / "migrations/0006_gemini_provider.sql").read_text())
 
     def prepare(self, sql):
         return Statement(self.conn, sql)
@@ -169,22 +170,36 @@ def test_admin_encrypted_credential_and_custom_model_routes():
             assert credential.status_code == 201, credential.text
             assert credential.json()["credential_last4"] == "1234"
             assert "credential_ciphertext" not in credential.json()
-            credential_id = credential.json()["id"]
+            custom_credential_id = credential.json()["id"]
+            gemini_credential = client.post("/api/v1/admin/provider-credentials", headers=headers, json={
+                "name": "Gemini translation key", "provider_type": "gemini", "api_key": "gemini-secret-5678",
+                "api_format": "openai_chat", "auth_type": "bearer", "auth_header": "Authorization", "enabled": True,
+            })
+            assert gemini_credential.status_code == 201, gemini_credential.text
+            gemini_credential_id = gemini_credential.json()["id"]
             rows = client.get("/api/v1/admin/provider-credentials", headers=headers)
-            assert rows.status_code == 200 and rows.json()[0]["id"] == credential_id
+            assert rows.status_code == 200 and len(rows.json()) == 2
+            gemini_model = client.post("/api/v1/admin/ai-models", headers=headers, json={
+                "provider": "gemini", "capability": "translation", "model_id": "gemini-2.5-flash",
+                "display_name": "Gemini 2.5 Flash", "secret_name": "ADMIN_VAULT", "credential_id": gemini_credential_id,
+                "priority": 0, "enabled": True, "rpm_limit": 5, "daily_limit": 20, "concurrency_limit": 1,
+                "catalog": {"model_id": "gemini-2.5-flash"},
+            })
+            assert gemini_model.status_code == 201, gemini_model.text
             custom_model = client.post("/api/v1/admin/ai-models", headers=headers, json={
                 "provider": "custom", "capability": "translation", "model_id": "example-model",
-                "display_name": "Example model", "secret_name": "ADMIN_VAULT", "credential_id": credential_id,
+                "display_name": "Example model", "secret_name": "ADMIN_VAULT", "credential_id": custom_credential_id,
                 "priority": 1, "enabled": True, "rpm_limit": 5, "daily_limit": 20, "concurrency_limit": 1,
                 "catalog": {"model_id": "example-model"},
             })
             assert custom_model.status_code == 201, custom_model.text
-            assert custom_model.json()["credential_id"] == credential_id
-            disabled = client.delete(f"/api/v1/admin/provider-credentials/{credential_id}", headers=headers)
+            assert custom_model.json()["credential_id"] == custom_credential_id
+            disabled = client.delete(f"/api/v1/admin/provider-credentials/{custom_credential_id}", headers=headers)
             assert disabled.status_code == 200
             model_rows = client.get("/api/v1/admin/ai-models", headers=headers)
             assert model_rows.status_code == 200
-            assert model_rows.json()[0]["enabled"] is False
+            disabled_row = next(row for row in model_rows.json() if row["model_id"] == "example-model")
+            assert disabled_row["enabled"] is False and disabled_row["credential_id"] is None
     finally:
         main.encrypt_secret = original_encrypt
 

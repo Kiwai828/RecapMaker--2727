@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The **Provider credentials** panel lets an administrator add, rotate, disable, and remove API keys without placing the provider key in the Android APK or editing Cloudflare Worker secret bindings for each provider key. OpenRouter and OpenCode Zen are built-in provider types. A **Custom** provider supports HTTPS OpenAI-compatible APIs for text translation and JSON/base64 audio transcription.
+The **Provider credentials** panel lets an administrator add, rotate, disable, and remove API keys without placing the provider key in the Android APK or editing Cloudflare Worker secret bindings for each provider key. OpenRouter, OpenCode Zen, and Gemini are built-in provider types. A **Custom** provider supports HTTPS OpenAI-compatible APIs for text translation and JSON/base64 audio transcription.
 
 > API keys entered in the Admin panel are encrypted with AES-GCM in the Worker before they are stored in D1. The UI and list API expose only the final four characters. Provider key plaintext is never returned after submission.
 
@@ -21,6 +21,7 @@ Use a new random value of at least 32 characters. It encrypts all Admin-panel pr
 | `PROVIDER_CREDENTIAL_MASTER_KEY` | Cloudflare Worker Secret | No — set once in Cloudflare |
 | OpenRouter API keys | Encrypted D1 credential vault | Yes |
 | OpenCode Zen API keys | Encrypted D1 credential vault | Yes |
+| Gemini API keys | Encrypted D1 credential vault | Yes |
 | Custom provider API keys | Encrypted D1 credential vault | Yes |
 
 ## Built-in Providers
@@ -31,6 +32,7 @@ Create an encrypted credential before adding models.
 |---|---|---|---|
 | OpenRouter built-in | `OpenRouter Whisper key` | OpenAI audio transcription | STT |
 | OpenCode Zen built-in | `Zen translation key 1` | OpenAI chat completions | Translation |
+| Gemini built-in | `Gemini translation key` | Gemini generateContent | Translation |
 | Custom provider | `Company gateway key` | Choose the compatible format | STT or Translation |
 
 For VoiceRecap's intended chain, create these model rows in **AI provider models** after fetching each live catalog:
@@ -40,6 +42,7 @@ For VoiceRecap's intended chain, create these model rows in **AI provider models
 | OpenRouter | `openai/whisper-large-v3` | STT | 0 |
 | OpenCode Zen | `deepseek-v4-flash-free` | Translation | 0 |
 | OpenCode Zen | `mimo-v2.5-free` | Translation | 1 |
+| Gemini | Select a current model from the live Gemini catalog | Translation | 2, or 0 if Gemini should be primary |
 
 A user processing request is submitted only once. If the priority-0 translation model rejects the request with a retryable provider response, the backend can select the priority-1 model within that same server-side request. The Android app must not send multiple full audio requests.
 
@@ -47,7 +50,7 @@ A user processing request is submitted only once. If the priority-0 translation 
 
 Custom providers must use HTTPS. Use a base URL that ends in a version root such as `https://provider.example/v1`. The current custom adapter appends `/models`, `/chat/completions`, or `/audio/transcriptions` as applicable. The custom provider must accept an OpenAI-compatible JSON request and Bearer or configured header authentication.
 
-For non-OpenAI-compatible providers, add a dedicated provider adapter rather than selecting Custom JSON. This keeps the video-dubbing segment schema and response validation reliable.
+Gemini uses its built-in `generativelanguage.googleapis.com` catalog and `generateContent` endpoints with the encrypted key sent as `x-goog-api-key`; a custom base URL is not required. For non-OpenAI-compatible providers other than Gemini, add a dedicated provider adapter rather than selecting Custom JSON. This keeps the video-dubbing segment schema and response validation reliable.
 
 ## Operational Safety
 

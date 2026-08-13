@@ -84,7 +84,7 @@ class SlotBody(BaseModel):
 
 class AiProviderModelBody(BaseModel):
     id: str | None = None
-    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|gemini|custom)$")
     capability: str = Field(pattern="^(stt|translation)$")
     model_id: str = Field(min_length=1, max_length=200)
     display_name: str | None = Field(default=None, max_length=200)
@@ -99,7 +99,7 @@ class AiProviderModelBody(BaseModel):
 
 
 class AiCatalogQuery(BaseModel):
-    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen|gemini|custom)$")
     capability: str = Field(pattern="^(stt|translation)$")
     secret_name: str = Field(default="", max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
     credential_id: str | None = Field(default=None, max_length=100)
@@ -108,7 +108,7 @@ class AiCatalogQuery(BaseModel):
 class ProviderCredentialBody(BaseModel):
     id: str | None = None
     name: str = Field(min_length=1, max_length=100)
-    provider_type: str = Field(pattern="^(openrouter_stt|opencode_zen|custom)$")
+    provider_type: str = Field(pattern="^(openrouter_stt|opencode_zen|gemini|custom)$")
     api_key: str | None = Field(default=None, min_length=1, max_length=1000)
     base_url: str | None = Field(default=None, max_length=500)
     models_url: str | None = Field(default=None, max_length=500)
@@ -200,7 +200,7 @@ def safe_provider_url(value: str | None, *, required: bool = False) -> str | Non
 
 
 def provider_capability_valid(provider: str, capability: str) -> bool:
-    return provider == 'custom' or (provider, capability) in {('openrouter_stt', 'stt'), ('opencode_zen', 'translation')}
+    return provider == 'custom' or (provider, capability) in {('openrouter_stt', 'stt'), ('opencode_zen', 'translation'), ('gemini', 'translation')}
 
 
 def configured_admin_email(env: Any) -> str:
@@ -830,7 +830,7 @@ async def admin_provider_credential_delete(request: Request, credential_id: str,
 @app.get("/api/v1/admin/ai-models/catalog")
 async def admin_ai_model_catalog(
     request: Request,
-    provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen|custom)$"),
+    provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen|gemini|custom)$"),
     capability: str = Query(..., pattern="^(stt|translation)$"),
     secret_name: str | None = Query(default=None, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
     credential_id: str | None = Query(default=None, max_length=100),
@@ -868,7 +868,7 @@ async def admin_ai_model_create(request: Request, body: AiProviderModelBody, adm
         credential = await first_row(db, "SELECT id,provider_type,enabled FROM ai_provider_credentials WHERE id=?", body.credential_id)
         if not credential or not credential.get('enabled'):
             raise HTTPException(status_code=422, detail="Selected provider credential is unavailable")
-        if credential.get('provider_type') not in {body.provider, 'custom'} and body.provider != 'custom':
+        if credential.get('provider_type') != body.provider:
             raise HTTPException(status_code=422, detail="Credential provider does not match model provider")
     model_id = body.id or str(uuid.uuid4())
     catalog = dict(body.catalog or {})
@@ -887,7 +887,7 @@ async def admin_ai_model_update(request: Request, model_id: str, body: AiProvide
         credential = await first_row(db, "SELECT id,provider_type,enabled FROM ai_provider_credentials WHERE id=?", body.credential_id)
         if not credential or not credential.get('enabled'):
             raise HTTPException(status_code=422, detail="Selected provider credential is unavailable")
-        if credential.get('provider_type') not in {body.provider, 'custom'} and body.provider != 'custom':
+        if credential.get('provider_type') != body.provider:
             raise HTTPException(status_code=422, detail="Credential provider does not match model provider")
     await run(db, "UPDATE ai_provider_models SET provider=?,capability=?,model_id=?,display_name=?,secret_name=?,credential_id=?,priority=?,enabled=?,rpm_limit=?,daily_limit=?,concurrency_limit=?,catalog_json=?,last_catalog_at=datetime('now'),updated_at=datetime('now') WHERE id=?", body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.credential_id, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(body.catalog or {}), model_id)
     row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)

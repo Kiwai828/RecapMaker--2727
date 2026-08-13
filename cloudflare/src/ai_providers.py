@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlencode
 
 from js import Object, fetch
 from pyodide.ffi import to_js
@@ -17,9 +18,12 @@ OPENROUTER_STT_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?output_modalities=transcription"
 ZEN_CHAT_URL = "https://opencode.ai/zen/v1/chat/completions"
 ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
+GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODELS_URL = GEMINI_API_ROOT + "/models"
 
 STT_PROVIDER = "openrouter_stt"
 TRANSLATION_PROVIDER = "opencode_zen"
+GEMINI_PROVIDER = "gemini"
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -155,6 +159,24 @@ def _credential_url(row: dict[str, Any] | None, suffix: str) -> str:
     return base + suffix
 
 
+def _gemini_catalog_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    raw_name = str(item.get("name") or item.get("id") or "").strip()
+    normalized["id"] = raw_name.removeprefix("models/")
+    normalized["name"] = str(item.get("displayName") or normalized["id"])
+    normalized["pricing"] = {"prompt": "unknown", "completion": "unknown", "request": "unknown"}
+    normalized["context_length"] = item.get("inputTokenLimit")
+    normalized["supported_parameters"] = item.get("supportedGenerationMethods") or []
+    return _catalog_item(GEMINI_PROVIDER, normalized)
+
+
+def _gemini_generate_url(credential: dict[str, Any] | None, model_id: str) -> str:
+    base = str((credential or {}).get("base_url") or GEMINI_API_ROOT).rstrip("/")
+    if base.endswith("/models"):
+        return f"{base}/{model_id}:generateContent"
+    return f"{base}/models/{model_id}:generateContent"
+
+
 def _catalog_item(provider: str, item: dict[str, Any]) -> dict[str, Any]:
     architecture = item.get("architecture") if isinstance(item.get("architecture"), dict) else {}
     pricing = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
@@ -183,21 +205,28 @@ async def fetch_catalog(env: Any, provider: str, secret_name: str = "", credenti
         url = str((credential or {}).get("models_url") or OPENROUTER_MODELS_URL)
     elif provider == TRANSLATION_PROVIDER:
         url = str((credential or {}).get("models_url") or ZEN_MODELS_URL)
+    elif provider == GEMINI_PROVIDER:
+        url = str((credential or {}).get("models_url") or GEMINI_MODELS_URL)
     elif provider == "custom":
         url = str((credential or {}).get("models_url") or _credential_url(credential, "/models"))
         if not url:
             raise AIProviderConfigurationError("Custom provider requires a model catalog URL or base URL")
     else:
         raise AIProviderConfigurationError(f"Unsupported provider: {provider}")
-    if provider == TRANSLATION_PROVIDER and not api_key:
-        raise AIProviderConfigurationError("An OpenCode Zen credential or legacy secret binding is required to fetch its catalog")
-    status, data = await request_json(url, headers=_auth_headers(api_key, credential))
+    if provider in {TRANSLATION_PROVIDER, GEMINI_PROVIDER} and not api_key:
+        label = "OpenCode Zen" if provider == TRANSLATION_PROVIDER else "Gemini"
+        raise AIProviderConfigurationError(f"A {label} credential or legacy secret binding is required to fetch its catalog")
+    headers = _auth_headers(api_key, credential)
+    if provider == GEMINI_PROVIDER:
+        headers.pop("Authorization", None)
+        headers["x-goog-api-key"] = api_key
+    status, data = await request_json(url, headers=headers)
     if status != 200:
         raise AIProviderError(provider, "CATALOG", status, provider_message(data))
     raw = data.get("data") if isinstance(data.get("data"), list) else data.get("models")
     if not isinstance(raw, list):
         raw = []
-    result = [_catalog_item(provider, item) for item in raw if isinstance(item, dict)]
+    result = [(_gemini_catalog_item(item) if provider == GEMINI_PROVIDER else _catalog_item(provider, item)) for item in raw if isinstance(item, dict)]
     return [item for item in result if item.get("model_id")]
 
 
@@ -355,6 +384,48 @@ async def zen_translate(env: Any, segments: list[dict[str, Any]], target_languag
     return merged, {"provider": TRANSLATION_PROVIDER, "model": model_row["model_id"], "row_id": model_row["id"], "usage": data.get("usage") or {}}
 
 
+async def gemini_translate(env: Any, segments: list[dict[str, Any]], target_language: str, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    api_key, credential = await _model_credential(env, model_row)
+    if not api_key:
+        raise AIProviderConfigurationError("Gemini credential is not configured")
+    source = [{"id": s["id"], "original_text": s["original_text"]} for s in segments]
+    prompt = (
+        "You are a professional subtitle translator and dubbing script editor. "
+        "Translate every segment faithfully into the requested target language. "
+        "Do not summarize, merge, split, reorder, add, or omit segments. "
+        "Return ONLY valid JSON with this exact shape: "
+        '{"segments":[{"id":"same id","translated_text":"translation","tts_text":"natural spoken dubbing text"}]}.'
+        "\n" + json.dumps({"target_language": target_language, "segments": source}, ensure_ascii=False, separators=(",", ":"))
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max(512, min(12000, len(source) * 180))},
+    }
+    url = _gemini_generate_url(credential, str(model_row["model_id"]))
+    status, data = await request_json(url, "POST", headers={"Accept": "application/json", "x-goog-api-key": api_key}, body=payload)
+    if status != 200:
+        raise AIProviderError(GEMINI_PROVIDER, "TRANSLATION", status, provider_message(data))
+    candidates = data.get("candidates") if isinstance(data.get("candidates"), list) else []
+    parts = ((candidates[0] or {}).get("content") or {}).get("parts", []) if candidates and isinstance(candidates[0], dict) else []
+    content = "".join(str(part.get("text") or "") for part in parts if isinstance(part, dict))
+    parsed = _json_from_content(content)
+    translated = parsed.get("segments")
+    if not isinstance(translated, list):
+        raise ValueError("translation_segments_missing")
+    by_id = {str(item.get("id")): item for item in translated if isinstance(item, dict) and item.get("id")}
+    if any(s["id"] not in by_id for s in segments):
+        raise ValueError("translation_segment_count_mismatch")
+    merged = []
+    for segment in segments:
+        item = by_id[segment["id"]]
+        translated_text = str(item.get("translated_text") or "").strip()
+        tts_text = str(item.get("tts_text") or translated_text).strip()
+        if not translated_text or not tts_text:
+            raise ValueError("translation_segment_empty")
+        merged.append({**segment, "translated_text": translated_text, "tts_text": tts_text})
+    return merged, {"provider": GEMINI_PROVIDER, "model": model_row["model_id"], "row_id": model_row["id"], "usage": data.get("usageMetadata") or {}}
+
+
 async def custom_translate(env: Any, segments: list[dict[str, Any]], target_language: str, model_row: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     api_key, credential = await _model_credential(env, model_row)
     if not api_key or not credential:
@@ -420,7 +491,11 @@ async def transcribe_and_translate(env: Any, audio: bytes, target_language: str)
     async def run_stt(row: dict[str, Any]):
         return await (custom_transcribe(env, audio, row) if row.get("provider") == "custom" else openrouter_transcribe(env, audio, row))
     async def run_translation(row: dict[str, Any]):
-        return await (custom_translate(env, segments, target_language, row) if row.get("provider") == "custom" else zen_translate(env, segments, target_language, row))
+        if row.get("provider") == "custom":
+            return await custom_translate(env, segments, target_language, row)
+        if row.get("provider") == GEMINI_PROVIDER:
+            return await gemini_translate(env, segments, target_language, row)
+        return await zen_translate(env, segments, target_language, row)
     segments, stt_meta = await _run_with_fallback(env, "stt", run_stt)
     translated, translation_meta = await _run_with_fallback(env, "translation", run_translation)
     result = {
