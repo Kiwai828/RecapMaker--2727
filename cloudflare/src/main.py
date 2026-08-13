@@ -838,8 +838,18 @@ async def admin_ai_model_catalog(
 ):
     if not provider_capability_valid(provider, capability):
         raise HTTPException(status_code=422, detail="Provider and capability do not match")
-    from ai_providers import fetch_catalog
-    models = await fetch_catalog(env_of(request), provider, secret_name, credential_id or "")
+    from ai_providers import AIProviderConfigurationError, AIProviderError, fetch_catalog
+    try:
+        models = await fetch_catalog(env_of(request), provider, secret_name, credential_id or "")
+    except AIProviderConfigurationError as exc:
+        raise HTTPException(status_code=422, detail={"code": "AI_PROVIDER_CONFIGURATION", "provider": provider, "message": str(exc)}) from exc
+    except AIProviderError as exc:
+        retry_after = "65" if int(exc.status) == 429 else None
+        extra = {"Retry-After": retry_after} if retry_after else None
+        raise HTTPException(status_code=int(exc.status) if 400 <= int(exc.status) <= 599 else 502, detail={"code": exc.code, "provider": exc.provider, "stage": exc.stage, "status": exc.status, "message": exc.provider_message or "Provider catalog request failed"}, headers=extra) from exc
+    except Exception as exc:
+        print(f"Provider catalog failure: {provider}: {exc!r}")
+        raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_CATALOG_FAILED", "provider": provider, "message": "Live catalog request failed; verify the credential and provider availability"}) from exc
     return json_response({"provider": provider, "capability": capability, "models": models, "fetched_at": datetime.now(timezone.utc).isoformat()})
 
 
