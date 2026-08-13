@@ -39,6 +39,7 @@ class D1:
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.executescript((Path(__file__).parent / "migrations/0001_initial.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0002_ai_provider_models.sql").read_text())
+        self.conn.executescript((Path(__file__).parent / "migrations/0003_retry_failed_jobs.sql").read_text())
 
     def prepare(self, sql):
         return Statement(self.conn, sql)
@@ -112,12 +113,17 @@ def test_cloudflare_core_lifecycle():
         plan = client.post("/api/v1/admin/plans", headers=headers, json={"name": "Creator", "included_credits": 100, "video_credit_cost": 12, "video_credit_cost_per_minute": 1, "tts_credit_per_100_chars": 2, "voice_clone_credit_cost": 5, "price_mmk": 3000, "price_usdt": "1.25", "validity_days": 30, "max_video_duration_seconds": 1800, "active": True, "sort_order": 1})
         assert plan.status_code == 201, plan.text
         assert plan.json()["price_usdt"] == "1.25"
+        failed_seed = "failed-stale-job"
+        env.DB.conn.execute("INSERT INTO processing_jobs(id,user_id,status,target_language,audio_key,idempotency_key,error_code,error_message) VALUES(?,?,?,?,?,?,?,?)", (failed_seed, logged_in.json()["user"]["id"], "failed", "my", "", "failed-retry-key", "no_gemini_slot_available", "old stale Gemini slot error"))
+        env.DB.conn.commit()
+        fresh_after_failed = client.post("/api/v1/transcribe", headers={**headers, "X-Target-Language": "my", "X-Video-Duration-Seconds": "61", "Idempotency-Key": "failed-retry-key", "Content-Type": "audio/wav"}, content=b"RIFF-fake-wave")
+        assert fresh_after_failed.status_code == 200 and fresh_after_failed.json()["job_id"] != failed_seed
         job = client.post("/api/v1/transcribe", headers={**headers, "X-Target-Language": "my", "X-Video-Duration-Seconds": "61", "Idempotency-Key": "job-1", "Content-Type": "audio/wav"}, content=b"RIFF-fake-wave")
         assert job.status_code == 200, job.text
         assert job.json()["status"] == "completed"
         assert job.json()["result"]["segments"][0]["translated_text"] == "မင်္ဂလာပါ"
         wallet = client.get("/api/v1/credits/balance", headers=headers).json()
-        assert wallet["balance"] == 20
+        assert wallet["balance"] == 10
         duplicate = client.post("/api/v1/transcribe", headers={**headers, "X-Target-Language": "my", "X-Video-Duration-Seconds": "61", "Idempotency-Key": "job-1", "Content-Type": "audio/wav"}, content=b"second")
         assert duplicate.json()["job_id"] == job.json()["job_id"]
         imported = client.post("/api/v1/backup/import", headers=headers, json={"profile": {"email": "admin@example.com"}, "projects": [{"external_id": "local-1", "title": "Restored project", "target_language": "my"}]})
