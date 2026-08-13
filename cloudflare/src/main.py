@@ -81,6 +81,27 @@ class SlotBody(BaseModel):
     concurrency_limit: int = Field(default=1, ge=1, le=50)
 
 
+class AiProviderModelBody(BaseModel):
+    id: str | None = None
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen)$")
+    capability: str = Field(pattern="^(stt|translation)$")
+    model_id: str = Field(min_length=1, max_length=200)
+    display_name: str | None = Field(default=None, max_length=200)
+    secret_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+    priority: int = Field(default=0, ge=0, le=1000)
+    enabled: bool = True
+    rpm_limit: int = Field(default=10, ge=1, le=100_000)
+    daily_limit: int = Field(default=100, ge=1, le=10_000_000)
+    concurrency_limit: int = Field(default=1, ge=1, le=50)
+    catalog: dict[str, Any] = Field(default_factory=dict)
+
+
+class AiCatalogQuery(BaseModel):
+    provider: str = Field(pattern="^(openrouter_stt|opencode_zen)$")
+    capability: str = Field(pattern="^(stt|translation)$")
+    secret_name: str = Field(min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
+
+
 class TtsGenerateBody(BaseModel):
     text: str = Field(min_length=1, max_length=20_000)
     voice_mode: str = Field(default="design", pattern="^(design|clone|ultimate_clone)$")
@@ -420,14 +441,11 @@ async def create_transcription_job(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255),
     user: dict[str, Any] = Depends(user_dep),
 ):
-    """Transcribe request-scoped audio without persisting any media.
+    """Run local-media transcription through the configured AI providers.
 
-    The Android client keeps the video, extracted WAV, transcript, TTS audio,
-    and final MP4 locally. This endpoint buffers only the current WAV in memory,
-    sends it to Gemini, and releases it before returning.
+    Audio is buffered only for this request. Video, subtitles, TTS audio, and
+    final MP4 remain on the Android device; provider keys remain server-side.
     """
-    from scheduler import transcribe_direct
-
     db = db_of(request)
     if idempotency_key:
         old = await first_row(db, "SELECT id,status,result_json,error_code,error_message,provider_model FROM processing_jobs WHERE user_id=? AND idempotency_key=?", user["id"], idempotency_key)
@@ -451,50 +469,35 @@ async def create_transcription_job(
         data = b""
         raise HTTPException(status_code=402, detail=str(exc)) from exc
 
-    # audio_key remains an empty compatibility field for the existing D1 schema;
-    # no media object is created in R2.
     await run(db, "INSERT INTO processing_jobs(id,user_id,status,target_language,audio_key,idempotency_key,credits_reserved,started_at) VALUES(?,?, 'processing',?,?,?, ?,datetime('now'))", job_id, user["id"], target_language.strip(), "", idempotency_key, cost)
-    await write_audit(db, user["id"], "transcription_started", "processing_job", job_id, {"credits_reserved": cost, "target_language": target_language.strip(), "media_retention": "none"})
+    await write_audit(db, user["id"], "transcription_started", "processing_job", job_id, {"credits_reserved": cost, "target_language": target_language.strip(), "media_retention": "none", "stt_provider": "openrouter_stt", "translation_provider": "opencode_zen"})
     try:
-        result, slot = await transcribe_direct(env_of(request), data, target_language.strip())
-        await run(db, "UPDATE processing_jobs SET status='completed',result_json=?,provider_model=?,provider_slot=?,credits_committed=credits_reserved,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", json.dumps(result, ensure_ascii=False, separators=(",", ":")), slot["model"], slot["id"], job_id)
-        await write_audit(db, user["id"], "transcription_completed", "processing_job", job_id, {"provider_model": slot["model"], "media_retention": "none"})
-        return json_response({"job_id": job_id, "status": "completed", "poll_after_seconds": 0, "result": result, "provider_model": slot["model"]})
+        from ai_providers import transcribe_and_translate
+        result, providers = await transcribe_and_translate(env_of(request), data, target_language.strip())
+        provider_model = f"{providers['stt']['model']} + {providers['translation']['model']}"
+        result["providers"] = providers
+        await run(db, "UPDATE processing_jobs SET status='completed',result_json=?,provider_model=?,provider_slot=?,credits_committed=credits_reserved,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", json.dumps(result, ensure_ascii=False, separators=(",", ":")), provider_model, providers["translation"]["row_id"], job_id)
+        await write_audit(db, user["id"], "transcription_completed", "processing_job", job_id, {"provider_model": provider_model, "media_retention": "none"})
+        return json_response({"job_id": job_id, "status": "completed", "poll_after_seconds": 0, "result": result, "provider_model": provider_model})
     except Exception as exc:
         text = str(exc)[:500]
-        error_code = str(getattr(exc, "code", "GEMINI_FAILED"))
+        error_code = str(getattr(exc, "code", "AI_PROVIDER_FAILED"))
         await run(db, "UPDATE processing_jobs SET status='failed',error_code=?,error_message=?,completed_at=datetime('now'),updated_at=datetime('now') WHERE id=?", error_code, text, job_id)
         await add_credits(db, user["id"], cost, "job_refund", reference_id=job_id, description="Refund for failed transcription", idempotency_key=f"refund:{job_id}")
-
-        if exc.__class__.__name__ == "GeminiCapacityError" or error_code == "GEMINI_CAPACITY":
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "GEMINI_CAPACITY", "message": "All configured Gemini slots are temporarily busy. No duplicate request was created; retry after the suggested delay."},
-                headers={"Retry-After": "30"},
-            ) from exc
-
-        if hasattr(exc, "status") and hasattr(exc, "code") and str(error_code).startswith("GEMINI_"):
+        if error_code == "AI_PROVIDER_CAPACITY" or exc.__class__.__name__ == "AIProviderCapacityError":
+            raise HTTPException(status_code=503, detail={"code": error_code, "message": "Configured transcription or translation models are temporarily busy. No duplicate request was created; try again later."}, headers={"Retry-After": "30"}) from exc
+        if exc.__class__.__name__ == "AIProviderConfigurationError":
+            raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_CONFIGURATION", "message": "AI provider is not configured. Ask the administrator to enable one OpenRouter STT model and one OpenCode Zen translation model."}) from exc
+        if hasattr(exc, "status") and hasattr(exc, "provider"):
             provider_status = int(exc.status)
+            provider = str(exc.provider)
             if provider_status == 429:
-                raise HTTPException(
-                    status_code=429,
-                    detail={"code": "GEMINI_RATE_LIMIT", "message": "Gemini provider rate limit reached for this project/key. Reserved credits were refunded; wait before retrying."},
-                    headers={"Retry-After": "65"},
-                ) from exc
+                raise HTTPException(status_code=429, detail={"code": "AI_PROVIDER_RATE_LIMIT", "provider": provider, "message": "The selected AI provider rate limit was reached. The failed model is temporarily cooled down and credits were refunded; do not submit duplicate requests."}, headers={"Retry-After": "65"}) from exc
             if provider_status in {408, 500, 502, 503, 504}:
-                raise HTTPException(
-                    status_code=503,
-                    detail={"code": "GEMINI_PROVIDER_TEMPORARY", "message": "Gemini is temporarily unavailable. Reserved credits were refunded; retry after the suggested delay."},
-                    headers={"Retry-After": "30"},
-                ) from exc
-            raise HTTPException(
-                status_code=502,
-                detail={"code": exc.code, "message": "Gemini rejected this model/request. Check the configured model ID and API key/project."},
-            ) from exc
-
-        raise HTTPException(status_code=502, detail={"code": "GEMINI_FAILED", "message": "Gemini transcription failed; reserved credits were refunded."}) from exc
+                raise HTTPException(status_code=503, detail={"code": "AI_PROVIDER_TEMPORARY", "provider": provider, "message": "The selected AI provider is temporarily unavailable. Credits were refunded; retry later."}, headers={"Retry-After": "30"}) from exc
+            raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_REJECTED", "provider": provider, "message": "The configured model or API key was rejected. Choose a current model from the Admin model catalog and verify the secret binding."}) from exc
+        raise HTTPException(status_code=502, detail={"code": "AI_PROVIDER_FAILED", "message": "Transcription or translation failed; reserved credits were refunded."}) from exc
     finally:
-        # Drop the only request-scoped media reference as soon as the call ends.
         data = b""
 
 
@@ -659,6 +662,73 @@ async def admin_payment_approve(request: Request, order_id: str, admin: dict[str
     await add_credits(db, order["user_id"], int(plan.get("included_credits") or 0), "plan_purchase", reference_id=order_id, description=f"Approved {plan['name']} plan", actor_user_id=admin["id"], idempotency_key=f"payment:{order_id}")
     await write_audit(db, admin["id"], "payment_approved", "payment_order", order_id, {"user_id": order["user_id"], "plan_id": plan["id"]})
     return json_response({"ok": True, "order_id": order_id, "plan": plan["name"]})
+
+
+
+def _ai_model_public(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    result["enabled"] = bool(result.get("enabled"))
+    result["catalog"] = loads(result.get("catalog_json") or "{}") or {}
+    result.pop("catalog_json", None)
+    return result
+
+
+@app.get("/api/v1/admin/ai-models/catalog")
+async def admin_ai_model_catalog(
+    request: Request,
+    provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen)$"),
+    capability: str = Query(..., pattern="^(stt|translation)$"),
+    secret_name: str = Query(..., min_length=1, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
+    admin: dict[str, Any] = Depends(admin_dep),
+):
+    if (provider, capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+        raise HTTPException(status_code=422, detail="Provider and capability do not match")
+    from ai_providers import fetch_catalog
+    models = await fetch_catalog(env_of(request), provider, secret_name)
+    return json_response({"provider": provider, "capability": capability, "models": models, "fetched_at": datetime.now(timezone.utc).isoformat()})
+
+
+@app.get("/api/v1/admin/ai-models")
+async def admin_ai_models(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
+    rows = await all_rows(db_of(request), "SELECT id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,active_requests,window_used,daily_used,cooldown_until,fail_count,last_used_at,catalog_json,last_catalog_at,created_at,updated_at FROM ai_provider_models ORDER BY capability,priority,provider,model_id")
+    return json_response([_ai_model_public(row) for row in rows])
+
+
+@app.post("/api/v1/admin/ai-models")
+async def admin_ai_model_create(request: Request, body: AiProviderModelBody, admin: dict[str, Any] = Depends(admin_dep)):
+    if (body.provider, body.capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+        raise HTTPException(status_code=422, detail="Provider and capability do not match")
+    db = db_of(request)
+    model_id = body.id or str(uuid.uuid4())
+    catalog = dict(body.catalog or {})
+    await run(db, "INSERT INTO ai_provider_models(id,provider,capability,model_id,display_name,secret_name,priority,enabled,rpm_limit,daily_limit,concurrency_limit,catalog_json,last_catalog_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))", model_id, body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(catalog))
+    await write_audit(db, admin["id"], "ai_model_created", "ai_provider_model", model_id, {"provider": body.provider, "capability": body.capability, "model_id": body.model_id, "secret_name": body.secret_name, "priority": body.priority})
+    row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
+    return json_response(_ai_model_public(row or {}), status=201)
+
+
+@app.patch("/api/v1/admin/ai-models/{model_id}")
+async def admin_ai_model_update(request: Request, model_id: str, body: AiProviderModelBody, admin: dict[str, Any] = Depends(admin_dep)):
+    if (body.provider, body.capability) not in {("openrouter_stt", "stt"), ("opencode_zen", "translation")}:
+        raise HTTPException(status_code=422, detail="Provider and capability do not match")
+    db = db_of(request)
+    await run(db, "UPDATE ai_provider_models SET provider=?,capability=?,model_id=?,display_name=?,secret_name=?,priority=?,enabled=?,rpm_limit=?,daily_limit=?,concurrency_limit=?,catalog_json=?,last_catalog_at=datetime('now'),updated_at=datetime('now') WHERE id=?", body.provider, body.capability, body.model_id.strip(), (body.display_name or body.model_id).strip(), body.secret_name, body.priority, int(body.enabled), body.rpm_limit, body.daily_limit, body.concurrency_limit, dumps(body.catalog or {}), model_id)
+    row = await first_row(db, "SELECT * FROM ai_provider_models WHERE id=?", model_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="AI model not found")
+    await write_audit(db, admin["id"], "ai_model_updated", "ai_provider_model", model_id, {"provider": body.provider, "capability": body.capability, "model_id": body.model_id, "secret_name": body.secret_name, "priority": body.priority, "enabled": body.enabled})
+    return json_response(_ai_model_public(row))
+
+
+@app.delete("/api/v1/admin/ai-models/{model_id}")
+async def admin_ai_model_delete(request: Request, model_id: str, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    row = await first_row(db, "SELECT id,provider,capability,model_id FROM ai_provider_models WHERE id=?", model_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="AI model not found")
+    await run(db, "DELETE FROM ai_provider_models WHERE id=?", model_id)
+    await write_audit(db, admin["id"], "ai_model_deleted", "ai_provider_model", model_id, row)
+    return json_response({"ok": True, "id": model_id})
 
 
 @app.get("/api/v1/admin/gemini-slots")
