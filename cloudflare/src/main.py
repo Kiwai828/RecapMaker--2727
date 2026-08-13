@@ -448,11 +448,18 @@ async def create_transcription_job(
     """
     db = db_of(request)
     if idempotency_key:
-        old = await first_row(db, "SELECT id,status,result_json,error_code,error_message,provider_model FROM processing_jobs WHERE user_id=? AND idempotency_key=?", user["id"], idempotency_key)
-        if old:
+        old = await first_row(db, "SELECT id,status,result_json,error_code,error_message,provider_model FROM processing_jobs WHERE user_id=? AND idempotency_key=? ORDER BY created_at DESC LIMIT 1", user["id"], idempotency_key)
+        # A completed or still-running job is safely idempotent. A failed job
+        # must not trap Android WorkManager in a retry loop returning the same
+        # stale provider error forever; a new attempt gets a fresh job ID and
+        # reservation while the failed job remains auditable.
+        if old and old.get("status") in {"queued", "processing", "completed"}:
             return json_response(_job_payload(old))
     plan = await active_plan(db, user["id"])
-    jobs_today = await first_row(db, "SELECT COUNT(*) AS count FROM processing_jobs WHERE user_id=? AND created_at>=date('now')", user["id"])
+    # Free quota counts only completed processing jobs. Failed attempts caused by
+    # provider capacity, rate limits, DNS, or server errors must be refunded and
+    # must not consume the user's daily allowance.
+    jobs_today = await first_row(db, "SELECT COUNT(*) AS count FROM processing_jobs WHERE user_id=? AND status='completed' AND created_at>=date('now')", user["id"])
     free_limit = int(getattr(env_of(request), "FREE_DAILY_JOB_LIMIT", "3"))
     if plan.get("name") == "Free" and int((jobs_today or {}).get("count") or 0) >= free_limit:
         raise HTTPException(status_code=429, detail="Daily free processing limit reached")
