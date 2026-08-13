@@ -832,7 +832,7 @@ async def admin_ai_model_catalog(
     request: Request,
     provider: str = Query(..., pattern="^(openrouter_stt|opencode_zen|custom)$"),
     capability: str = Query(..., pattern="^(stt|translation)$"),
-    secret_name: str = Query(default="", max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
+    secret_name: str | None = Query(default=None, max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$"),
     credential_id: str | None = Query(default=None, max_length=100),
     admin: dict[str, Any] = Depends(admin_dep),
 ):
@@ -840,7 +840,7 @@ async def admin_ai_model_catalog(
         raise HTTPException(status_code=422, detail="Provider and capability do not match")
     from ai_providers import AIProviderConfigurationError, AIProviderError, fetch_catalog
     try:
-        models = await fetch_catalog(env_of(request), provider, secret_name, credential_id or "")
+        models = await fetch_catalog(env_of(request), provider, secret_name or "", credential_id or "")
     except AIProviderConfigurationError as exc:
         raise HTTPException(status_code=422, detail={"code": "AI_PROVIDER_CONFIGURATION", "provider": provider, "message": str(exc)}) from exc
     except AIProviderError as exc:
