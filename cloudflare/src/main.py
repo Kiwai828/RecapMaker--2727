@@ -234,6 +234,7 @@ async def ready(request: Request):
 
 
 @app.post("/api/v1/auth/register")
+@app.post("/api/v1/register")
 async def register(request: Request, body: RegisterBody):
     db = db_of(request)
     if body.email == configured_admin_email(env_of(request)):
@@ -256,6 +257,7 @@ async def register(request: Request, body: RegisterBody):
 
 
 @app.post("/api/v1/auth/login")
+@app.post("/api/v1/login")
 async def login(request: Request, body: LoginBody):
     db = db_of(request)
     email = body.email.strip().lower()
