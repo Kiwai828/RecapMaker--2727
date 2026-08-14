@@ -9,8 +9,21 @@ import uuid
 import wave
 from typing import Any
 
-from js import Object, Uint8Array, fetch
-from pyodide.ffi import to_js
+try:
+    from js import Object, Uint8Array, fetch
+    from pyodide.ffi import to_js
+except ImportError:  # Local test harness; Cloudflare Workers provides these bindings.
+    class _Object:
+        @staticmethod
+        def fromEntries(value: Any) -> dict[str, Any]:
+            return dict(value)
+
+    Object = _Object
+    Uint8Array = None
+    fetch = None
+
+    def to_js(value: Any, **kwargs: Any) -> Any:
+        return value
 
 from credits import CreditError, add_credits, tts_cost
 

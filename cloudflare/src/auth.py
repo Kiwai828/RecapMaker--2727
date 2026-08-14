@@ -90,6 +90,18 @@ async def issue_tokens(db: Any, env: Any, user: dict[str, Any]) -> dict[str, Any
     }
 
 
+EXTERNAL_TOKEN_PREFIX = "vrtts_"
+
+
+def new_external_api_token() -> tuple[str, str, str]:
+    raw = EXTERNAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw[:12]
+
+
+def hash_external_api_token(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": user["id"],
@@ -115,6 +127,20 @@ async def current_user(request: Any, env: Any, db: Any) -> dict[str, Any]:
     )
     if not row or not row.get("is_active") or row.get("is_banned"):
         raise PermissionError("Account unavailable")
+    return row
+
+
+async def external_token_user(db: Any, token: str, required_scope: str = "tts:voice_clone") -> dict[str, Any]:
+    token_hash = hash_external_api_token(token)
+    row = await first_row(
+        db,
+        "SELECT u.* FROM external_api_tokens t JOIN users u ON u.id=t.owner_user_id WHERE t.token_hash=? AND t.scope=? AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>datetime('now')) AND u.is_active=1 AND u.is_banned=0",
+        token_hash,
+        required_scope,
+    )
+    if not row:
+        raise PermissionError("Invalid, expired, or revoked external API token")
+    await run(db, "UPDATE external_api_tokens SET last_used_at=datetime('now'),request_count=request_count+1 WHERE token_hash=?", token_hash)
     return row
 
 

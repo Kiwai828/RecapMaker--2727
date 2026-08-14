@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
-from auth import current_user, hash_password, issue_tokens, public_user, require_admin, verify_password
+from auth import current_user, external_token_user, hash_external_api_token, hash_password, issue_tokens, new_external_api_token, public_user, require_admin, verify_password
 from credits import CreditError, active_plan, add_credits, balance, ensure_account, video_cost
 from db import all_rows, dumps, first_row, loads, run
 from admin_page import ADMIN_HTML
@@ -103,6 +103,11 @@ class AiCatalogQuery(BaseModel):
     capability: str = Field(pattern="^(stt|translation)$")
     secret_name: str = Field(default="", max_length=100, pattern=r"^[A-Z][A-Z0-9_]*$")
     credential_id: str | None = Field(default=None, max_length=100)
+
+
+class ExternalApiTokenBody(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    expires_days: int = Field(default=0, ge=0, le=3650)
 
 
 class ProviderCredentialBody(BaseModel):
@@ -253,6 +258,19 @@ async def admin_dep(user: dict[str, Any] = Depends(user_dep)) -> dict[str, Any]:
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return user
+
+
+async def tts_user_dep(request: Request) -> dict[str, Any]:
+    header = request.headers.get("Authorization", "")
+    if not header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    token = header.split(" ", 1)[1].strip()
+    if token.startswith("vrtts_"):
+        try:
+            return await external_token_user(db_of(request), token, "tts:voice_clone")
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc), headers={"WWW-Authenticate": "Bearer"}) from exc
+    return await user_dep(request)
 
 
 async def write_audit(db: Any, actor: str | None, action: str, target_type: str | None = None, target_id: str | None = None, metadata: dict[str, Any] | None = None) -> None:
@@ -413,7 +431,7 @@ async def usage_summary(request: Request, user: dict[str, Any] = Depends(user_de
 
 
 @app.post("/api/v1/tts/generate")
-async def proxy_tts(request: Request, body: TtsGenerateBody, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255), user: dict[str, Any] = Depends(user_dep)):
+async def proxy_tts(request: Request, body: TtsGenerateBody, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255), user: dict[str, Any] = Depends(tts_user_dep)):
     from tts_proxy import TtsProxyError, generate as tts_generate
     try:
         result = await tts_generate(env_of(request), db_of(request), user["id"], body.model_dump(), body.text, await active_plan(db_of(request), user["id"]), idempotency_key)
@@ -423,7 +441,7 @@ async def proxy_tts(request: Request, body: TtsGenerateBody, idempotency_key: st
 
 
 @app.post("/api/v1/tts/batch")
-async def proxy_tts_batch(request: Request, body: TtsBatchBody, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255), user: dict[str, Any] = Depends(user_dep)):
+async def proxy_tts_batch(request: Request, body: TtsBatchBody, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=255), user: dict[str, Any] = Depends(tts_user_dep)):
     from tts_proxy import TtsProxyError, batch as tts_batch
     plan = await active_plan(db_of(request), user["id"])
     max_end = max(item.target_end_ms for item in body.segments)
@@ -761,6 +779,37 @@ def _ai_model_public(row: dict[str, Any], env: Any | None = None) -> dict[str, A
     result["catalog"] = loads(result.get("catalog_json") or "{}") or {}
     result.pop("catalog_json", None)
     return result
+
+
+@app.get("/api/v1/admin/external-api-tokens")
+async def admin_external_api_tokens(request: Request, admin: dict[str, Any] = Depends(admin_dep)):
+    rows = await all_rows(db_of(request), "SELECT t.id,t.name,t.token_prefix,t.scope,t.created_at,t.expires_at,t.revoked_at,t.last_used_at,t.request_count,u.email AS owner_email FROM external_api_tokens t JOIN users u ON u.id=t.owner_user_id ORDER BY t.created_at DESC")
+    return json_response(rows)
+
+
+@app.post("/api/v1/admin/external-api-tokens")
+async def admin_external_api_token_create(request: Request, body: ExternalApiTokenBody, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    token, token_hash, token_prefix = new_external_api_token()
+    token_id = str(uuid.uuid4())
+    modifier = f"+{body.expires_days} days"
+    await run(db, "INSERT INTO external_api_tokens(id,name,token_hash,token_prefix,scope,owner_user_id,created_by_user_id,expires_at) VALUES(?,?,?,?,?,?,?,CASE WHEN ?=0 THEN NULL ELSE datetime('now',?) END)", token_id, body.name.strip(), token_hash, token_prefix, "tts:voice_clone", admin["id"], admin["id"], body.expires_days, modifier)
+    await write_audit(db, admin["id"], "external_api_token_created", "external_api_token", token_id, {"name": body.name.strip(), "scope": "tts:voice_clone", "expires_days": body.expires_days, "token_prefix": token_prefix})
+    row = await first_row(db, "SELECT id,name,token_prefix,scope,created_at,expires_at,revoked_at,last_used_at,request_count FROM external_api_tokens WHERE id=?", token_id)
+    return json_response({**(row or {}), "token": token}, status=201)
+
+
+@app.delete("/api/v1/admin/external-api-tokens/{token_id}")
+async def admin_external_api_token_revoke(request: Request, token_id: str, admin: dict[str, Any] = Depends(admin_dep)):
+    db = db_of(request)
+    row = await first_row(db, "SELECT id,name,token_prefix,scope,revoked_at FROM external_api_tokens WHERE id=?", token_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="External API token not found")
+    if row.get("revoked_at"):
+        return json_response({"ok": True, "id": token_id, "already_revoked": True})
+    await run(db, "UPDATE external_api_tokens SET revoked_at=datetime('now') WHERE id=? AND revoked_at IS NULL", token_id)
+    await write_audit(db, admin["id"], "external_api_token_revoked", "external_api_token", token_id, {"name": row.get("name"), "token_prefix": row.get("token_prefix")})
+    return json_response({"ok": True, "id": token_id, "revoked": True})
 
 
 @app.get("/api/v1/admin/provider-credentials")

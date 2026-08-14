@@ -43,6 +43,7 @@ class D1:
         self.conn.executescript((Path(__file__).parent / "migrations/0004_runtime_settings.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0005_provider_credentials.sql").read_text())
         self.conn.executescript((Path(__file__).parent / "migrations/0006_gemini_provider.sql").read_text())
+        self.conn.executescript((Path(__file__).parent / "migrations/0007_external_api_tokens.sql").read_text())
 
     def prepare(self, sql):
         return Statement(self.conn, sql)
@@ -204,6 +205,33 @@ def test_admin_encrypted_credential_and_custom_model_routes():
         main.encrypt_secret = original_encrypt
 
 
+def test_admin_external_token_generate_scope_and_revoke():
+    env = Env()
+    with TestClient(EnvMiddleware(main.app, env)) as client:
+        login = client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "correct horse battery staple"})
+        assert login.status_code == 200, login.text
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        created = client.post("/api/v1/admin/external-api-tokens", headers=headers, json={"name": "Other project", "expires_days": 30})
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["token"].startswith("vrtts_")
+        assert payload["scope"] == "tts:voice_clone"
+        assert "token_hash" not in payload
+        raw_token = payload["token"]
+        token_row = env.DB.conn.execute("SELECT token_hash,token_prefix FROM external_api_tokens WHERE id=?", (payload["id"],)).fetchone()
+        assert token_row and token_row[0] != raw_token and raw_token.startswith(token_row[1])
+        external_headers = {"Authorization": f"Bearer {raw_token}", "Idempotency-Key": "external-test-1"}
+        upstream_missing = client.post("/api/v1/tts/generate", headers=external_headers, json={"text": "hello", "voice_mode": "clone", "reference_audio_base64": "UklGRg=="})
+        assert upstream_missing.status_code == 503, upstream_missing.text
+        assert upstream_missing.json()["detail"]["code"] == "MODAL_ENDPOINT_MISSING"
+        listed = client.get("/api/v1/admin/external-api-tokens", headers=headers)
+        assert listed.status_code == 200 and listed.json()[0]["request_count"] == 1
+        revoked = client.delete(f"/api/v1/admin/external-api-tokens/{payload['id']}", headers=headers)
+        assert revoked.status_code == 200
+        denied = client.post("/api/v1/tts/generate", headers={"Authorization": f"Bearer {raw_token}"}, json={"text": "hello", "voice_mode": "clone", "reference_audio_base64": "UklGRg=="})
+        assert denied.status_code == 401, denied.text
+
+
 def test_admin_credential_route_surfaces_vault_configuration_error():
     async def missing_master_key(env, value):
         raise ValueError("PROVIDER_CREDENTIAL_MASTER_KEY must be configured with at least 32 characters")
@@ -230,4 +258,5 @@ def test_admin_credential_route_surfaces_vault_configuration_error():
 if __name__ == "__main__":
     test_cloudflare_core_lifecycle()
     test_admin_encrypted_credential_and_custom_model_routes()
+    test_admin_external_token_generate_scope_and_revoke()
     print("local API tests passed")
