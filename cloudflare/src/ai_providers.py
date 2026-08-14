@@ -27,6 +27,33 @@ GEMINI_PROVIDER = "gemini"
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
+TRANSLATION_CHUNK_MAX_CHARS = 12000
+
+
+def translation_chunks(segments: list[dict[str, Any]], max_chars: int = TRANSLATION_CHUNK_MAX_CHARS) -> list[list[dict[str, Any]]]:
+    """Split a transcript deterministically without splitting a segment."""
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    for segment in segments:
+        size = len(str(segment.get("original_text") or "")) + len(str(segment.get("id") or "")) + 64
+        if current and current_chars + size > max_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(segment)
+        current_chars += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _output_tokens_for_segments(count: int, per_segment: int) -> int:
+    # Deliberately no artificial upper cap: each provider applies its own hard
+    # model limit, while chunking keeps ordinary long videos within that limit.
+    return max(2048, int(count) * per_segment)
+
+
 TRANSLATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -379,7 +406,7 @@ async def zen_translate(env: Any, segments: list[dict[str, Any]], target_languag
         "model": str(model_row["model_id"]),
         "temperature": 0.1,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "max_tokens": max(512, min(12000, len(source) * 180)),
+        "max_tokens": _output_tokens_for_segments(len(source), 320),
     }
     status, data = await request_json(ZEN_CHAT_URL, "POST", headers=_auth_headers(api_key), body=payload)
     if status != 200:
@@ -424,7 +451,7 @@ async def gemini_translate(env: Any, segments: list[dict[str, Any]], target_lang
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max(2048, min(32768, len(source) * 320)), "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": _output_tokens_for_segments(len(source), 640), "responseMimeType": "application/json"},
     }
     url = _gemini_generate_url(credential, str(model_row["model_id"]))
     status, data = await request_json(url, "POST", headers={"Accept": "application/json", "x-goog-api-key": api_key}, body=payload)
@@ -518,14 +545,25 @@ async def _run_with_fallback(env: Any, capability: str, fn: Any) -> tuple[Any, d
 async def transcribe_and_translate(env: Any, audio: bytes, target_language: str) -> tuple[dict[str, Any], dict[str, Any]]:
     async def run_stt(row: dict[str, Any]):
         return await (custom_transcribe(env, audio, row) if row.get("provider") == "custom" else openrouter_transcribe(env, audio, row))
-    async def run_translation(row: dict[str, Any]):
+    async def run_translation(row: dict[str, Any], translation_segments: list[dict[str, Any]]):
         if row.get("provider") == "custom":
-            return await custom_translate(env, segments, target_language, row)
+            return await custom_translate(env, translation_segments, target_language, row)
         if row.get("provider") == GEMINI_PROVIDER:
-            return await gemini_translate(env, segments, target_language, row)
-        return await zen_translate(env, segments, target_language, row)
+            return await gemini_translate(env, translation_segments, target_language, row)
+        return await zen_translate(env, translation_segments, target_language, row)
     segments, stt_meta = await _run_with_fallback(env, "stt", run_stt)
-    translated, translation_meta = await _run_with_fallback(env, "translation", run_translation)
+    translated: list[dict[str, Any]] = []
+    translation_meta: dict[str, Any] = {}
+    chunks = translation_chunks(segments)
+    for chunk in chunks:
+        translated_chunk, chunk_meta = await _run_with_fallback(
+            env,
+            "translation",
+            lambda row, chunk=chunk: run_translation(row, chunk),
+        )
+        translated.extend(translated_chunk)
+        translation_meta = chunk_meta
+    translation_meta["chunks"] = len(chunks)
     result = {
         "source_language": str(stt_meta.get("source_language") or ""),
         "target_language": target_language,

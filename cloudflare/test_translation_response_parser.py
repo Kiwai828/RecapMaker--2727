@@ -17,7 +17,7 @@ pyodide.ffi = ffi
 sys.modules.setdefault("pyodide", pyodide)
 sys.modules.setdefault("pyodide.ffi", ffi)
 
-from ai_providers import AIProviderResponseError, _json_from_content
+from ai_providers import AIProviderResponseError, _json_from_content, _output_tokens_for_segments, translation_chunks
 
 
 def test_translation_json_parser_accepts_preamble_and_fences():
@@ -35,3 +35,15 @@ def test_translation_json_parser_rejects_truncated_string_with_provider_error():
         assert exc.provider == "opencode_zen"
     else:
         raise AssertionError("truncated JSON must raise AIProviderResponseError")
+
+
+def test_translation_chunks_preserve_order_and_do_not_split_segments():
+    segments = [{"id": f"seg-{i}", "original_text": "x" * 100} for i in range(30)]
+    chunks = translation_chunks(segments, max_chars=700)
+    assert len(chunks) > 1
+    assert [item["id"] for chunk in chunks for item in chunk] == [item["id"] for item in segments]
+    assert all(chunk for chunk in chunks)
+
+
+def test_output_budget_has_no_artificial_32768_ceiling():
+    assert _output_tokens_for_segments(100, 640) == 64000
