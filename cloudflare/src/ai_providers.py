@@ -28,6 +28,26 @@ GEMINI_PROVIDER = "gemini"
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 TRANSLATION_CHUNK_MAX_CHARS = 12000
+LANGUAGE_LABELS = {
+    "my": "Burmese (Myanmar)",
+    "my-mm": "Burmese (Myanmar)",
+    "th": "Thai",
+    "en": "English",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "vi": "Vietnamese",
+    "km": "Khmer",
+    "lo": "Lao",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tl": "Tagalog",
+}
+
+
+def target_language_label(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return LANGUAGE_LABELS.get(normalized, str(value or "English"))
 
 
 def translation_chunks(segments: list[dict[str, Any]], max_chars: int = TRANSLATION_CHUNK_MAX_CHARS) -> list[list[dict[str, Any]]]:
@@ -401,7 +421,7 @@ async def zen_translate(env: Any, segments: list[dict[str, Any]], target_languag
         "Return ONLY valid JSON with this exact shape: "
         '{"segments":[{"id":"same id","translated_text":"translation","tts_text":"natural spoken dubbing text"}]}.'
     )
-    user = json.dumps({"target_language": target_language, "segments": source}, ensure_ascii=False, separators=(",", ":"))
+    user = json.dumps({"target_language": target_language_label(target_language), "segments": source}, ensure_ascii=False, separators=(",", ":"))
     payload = {
         "model": str(model_row["model_id"]),
         "temperature": 0.1,
@@ -447,7 +467,7 @@ async def gemini_translate(env: Any, segments: list[dict[str, Any]], target_lang
         "Do not summarize, merge, split, reorder, add, or omit segments. "
         "Return ONLY valid JSON with this exact shape: "
         '{"segments":[{"id":"same id","translated_text":"translation","tts_text":"natural spoken dubbing text"}]}.'
-        "\n" + json.dumps({"target_language": target_language, "segments": source}, ensure_ascii=False, separators=(",", ":"))
+        "\n" + json.dumps({"target_language": target_language_label(target_language), "segments": source}, ensure_ascii=False, separators=(",", ":"))
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -490,7 +510,8 @@ async def custom_translate(env: Any, segments: list[dict[str, Any]], target_lang
         raise AIProviderConfigurationError("Custom translation provider requires a base URL")
     source = [{"id": s["id"], "original_text": s["original_text"]} for s in segments]
     system = 'Translate every segment faithfully. Return ONLY JSON with this shape: {"segments":[{"id":"same id","translated_text":"translation","tts_text":"spoken dubbing text"}]}'
-    payload = {"model": str(model_row["model_id"]), "temperature": 0.1, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps({"target_language": target_language, "segments": source}, ensure_ascii=False)}], "max_tokens": max(512, min(12000, len(source) * 180))}
+    payload = {"model": str(model_row["model_id"]), "temperature": 0.1, "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps({"target_language": target_language_label(target_language), "segments": source}, ensure_ascii=False)}
+], "max_tokens": max(512, min(12000, len(source) * 180))}
     status, data = await request_json(url, "POST", headers=_auth_headers(api_key, credential), body=payload)
     if status != 200:
         raise AIProviderError("custom", "TRANSLATION", status, provider_message(data))

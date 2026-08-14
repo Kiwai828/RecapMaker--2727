@@ -17,7 +17,7 @@ pyodide.ffi = ffi
 sys.modules.setdefault("pyodide", pyodide)
 sys.modules.setdefault("pyodide.ffi", ffi)
 
-from ai_providers import AIProviderResponseError, _json_from_content, _output_tokens_for_segments, translation_chunks
+from ai_providers import AIProviderResponseError, _json_from_content, _output_tokens_for_segments, target_language_label, translation_chunks
 
 
 def test_translation_json_parser_accepts_preamble_and_fences():
@@ -47,3 +47,8 @@ def test_translation_chunks_preserve_order_and_do_not_split_segments():
 
 def test_output_budget_has_no_artificial_32768_ceiling():
     assert _output_tokens_for_segments(100, 640) == 64000
+
+
+def test_burmese_target_language_uses_explicit_locale_label():
+    assert target_language_label("my") == "Burmese (Myanmar)"
+    assert target_language_label("my-MM") == "Burmese (Myanmar)"
